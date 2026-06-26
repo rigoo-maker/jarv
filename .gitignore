@@ -1,0 +1,6 @@
+# Generated dashboard output
+crypto_dashboard.html
+
+# Python
+__pycache__/
+*.pyc
