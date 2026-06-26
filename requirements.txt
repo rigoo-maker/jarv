@@ -1,0 +1,6 @@
+# KRYPT core is pure standard library — no install needed for Binance data,
+# indicators, scoring, backtesting, paper trading, or the dashboards.
+
+# Required ONLY for live trading on Coinbase Advanced Trade (JWT/ES256 auth):
+PyJWT>=2.8.0
+cryptography>=42.0.0
