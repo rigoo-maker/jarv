@@ -85,6 +85,40 @@ python3 -m krypt.app serve --strategy scalper
 # Only after testnet looks right: BINANCE_TESTNET=0  (REAL money)
 ```
 
+## Finding an edge: 10 strategies, ranked honestly
+
+KRYPT ships **10 distinct strategies** (`krypt/strats.py`) — `ema_cross`,
+`macd_cross`, `rsi_reversion`, `bb_breakout`, `bb_reversion`, `donchian_breakout`,
+`vwap_reversion`, `stochrsi_cross`, `adx_di`, `confluence`. The workflow:
+
+```bash
+python3 -m krypt.app download --days 21                      # 3 weeks of 1m candles
+python3 -m krypt.app compare  --days 21 --interval 1m        # rank all 10 after costs
+python3 -m krypt.app serve    --mode paper --strategy <winner>  # live-paper the best
+```
+
+`compare` runs every strategy through the realistic backtester (fees + slippage +
+compounding) and prints a leaderboard ranked by Sharpe. **The top row is a
+hypothesis, not an edge** — it's in-sample. Re-run on a *different* date range
+(out-of-sample) before believing it. That discipline is the actual edge.
+
+### About leverage (read before you set `--leverage`)
+
+Leverage is a knob, and the backtester models **liquidation** so you can see what
+it really does. Example from a single 3-week sample (winners at 1×, then 10×):
+
+| strategy | 1× return | 10× return |
+|----------|-----------|------------|
+| ema_cross | **+115%** | **−83%** |
+| confluence | +32% | −49% |
+| rsi_reversion | −51% | **−100% (liquidated)** |
+
+Same strategy, same data — **10× turned winners into losers and liquidated
+several to zero**, with max drawdowns near 100%. Leverage does not create edge;
+it multiplies whatever edge (or lack of it) you have, including the path to ruin.
+Start at `1×`. Raise it only on a strategy with a *proven, out-of-sample* edge,
+and even then conservatively.
+
 ## What's inside
 
 - **`indicators.py`** — advanced TA: EMA/SMA, RSI, MACD, Bollinger Bands, ATR,

@@ -26,6 +26,7 @@ from .alerts import default_rules
 from .strategies import make_strategy
 from .engine import Engine
 from . import dashboard, live_dashboard, indicators, data as datamod, backtest as bt
+from . import strats as stratlib
 from .scoring import score_snapshot
 from datetime import date, timedelta
 
@@ -157,6 +158,33 @@ def cmd_backtest(cfg, days, limit, fee_bps, slippage_bps, no_compound):
     bt.print_report(sym, cfg.interval, result, len(candles))
 
 
+def _load_candles(cfg, days, limit):
+    sym = cfg.symbols[0]
+    if days:
+        end = date.today() - timedelta(days=1)
+        start = end - timedelta(days=days - 1)
+        print(f"Loading {sym} {cfg.interval} {start}..{end} (data.binance.vision)")
+        return datamod.download_klines_range(sym, cfg.interval, start, end)
+    return BinanceClient(cfg).klines(sym, cfg.interval, min(limit, 1000))
+
+
+def cmd_compare(cfg, days, limit, leverage, fee_bps, slippage_bps, no_compound):
+    """Backtest all 10 strategies and rank them (the 'find the edge' step)."""
+    sym = cfg.symbols[0]
+    candles = _load_candles(cfg, days, limit)
+    if len(candles) < 80:
+        print("not enough candles to compare.", file=sys.stderr)
+        sys.exit(1)
+    rows = bt.compare(candles, stratlib.REGISTRY, leverage=leverage,
+                      fee_bps=fee_bps, slippage_bps=slippage_bps,
+                      compound=not no_compound)
+    bt.print_leaderboard(sym, cfg.interval, rows, leverage, len(candles))
+    if leverage >= 5:
+        liq = sum(r.get("liquidations", 0) for r in rows if "liquidations" in r)
+        print(f"\n  ⚠️  at {leverage}x, {liq} liquidation event(s) across strategies — "
+              "this is what 'high leverage' does to a thin edge.")
+
+
 def cmd_live(cfg, exchange):
     """Write a standalone live-tick dashboard (browser connects to exchange WS)."""
     sym = cfg.symbols[0]
@@ -169,7 +197,8 @@ def cmd_live(cfg, exchange):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
-    p.add_argument("command", choices=["analyze", "serve", "backtest", "live", "download"])
+    p.add_argument("command",
+                   choices=["analyze", "serve", "backtest", "compare", "live", "download"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
@@ -183,6 +212,7 @@ def main(argv=None):
     p.add_argument("--fee-bps", type=float, default=10.0, help="per-side taker fee bps")
     p.add_argument("--slippage-bps", type=float, default=2.0)
     p.add_argument("--no-compound", action="store_true", help="disable equity compounding")
+    p.add_argument("--leverage", type=float, default=1.0, help="leverage for compare/backtest")
     args = p.parse_args(argv)
 
     cfg = load_config(mode=args.mode, symbols=args.symbols,
@@ -201,6 +231,9 @@ def main(argv=None):
         elif args.command == "backtest":
             cmd_backtest(cfg, args.days, args.limit, args.fee_bps,
                          args.slippage_bps, args.no_compound)
+        elif args.command == "compare":
+            cmd_compare(cfg, args.days, args.limit, args.leverage,
+                        args.fee_bps, args.slippage_bps, args.no_compound)
         elif args.command == "download":
             cmd_download(cfg, args.days or 21, args.kind)
         elif args.command == "live":

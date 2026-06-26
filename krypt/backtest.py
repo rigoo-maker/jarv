@@ -61,56 +61,132 @@ class BacktestResult:
         }
 
 
-def run(candles, *, enter_score=35, exit_score=-10, fee_bps=10.0,
-        slippage_bps=2.0, start_equity=1000.0, compound=True, warmup=60):
-    """Long/flat backtest of the scoring engine over `candles`.
+def run(candles, *, fee_bps=10.0, slippage_bps=2.0, start_equity=1000.0,
+        compound=True, warmup=60):
+    """Long/flat backtest of the confluence scoring engine (no leverage, no short).
+    Thin wrapper over the fast precomputed path."""
+    from . import strats
+    cache = strats.precompute(candles)
+    return run_signal(cache, strats.confluence, leverage=1.0, fee_bps=fee_bps,
+                      slippage_bps=slippage_bps, start_equity=start_equity,
+                      compound=compound, warmup=warmup, allow_short=False)
 
-    fee_bps: round-trip-ish per-side taker fee in basis points (Binance ~10bps
-             taker; lower with BNB/maker). slippage_bps: assumed adverse fill.
-    compound: size each entry as full current equity (geometric compounding).
+
+def run_signal(cache, signal_fn, *, leverage=1.0, fee_bps=10.0, slippage_bps=2.0,
+               start_equity=1000.0, compound=True, warmup=60, allow_short=True):
+    """Backtest a signal strategy (+1/0/-1) over a precomputed `cache` (from
+    strats.precompute) with LEVERAGE and a liquidation model.
+
+    Liquidation is the honest part: a leveraged position is wiped when the adverse
+    move approaches 1/leverage (you can't lose more than your margin — you lose
+    ALL of it). This is why high leverage on a thin edge => ruin. The backtest
+    shows it instead of hiding it.
     """
+    closes = cache["close"]
+    n = len(closes)
     equity = start_equity
-    in_pos = False
-    entry_px = 0.0
-    entry_eq = 0.0
-    entry_bar = 0
-    fees_paid = 0.0
-    cost = (fee_bps + slippage_bps) / 1e4   # per side
+    pos = 0                 # -1, 0, +1
+    entry = 0.0
+    cost = (fee_bps + slippage_bps) / 1e4
     curve = [equity]
     trades = []
+    fees_paid = 0.0
+    liquidations = 0
+    maint = 0.95 / max(leverage, 1.0)   # adverse fraction that liquidates
 
-    for i in range(warmup, len(candles)):
-        window = candles[: i + 1]
-        snap = indicators.compute_all(window)["latest"]
-        score = score_snapshot(snap)["score"]
-        px = window[-1]["close"]
+    def close(px, i):
+        nonlocal equity, pos, fees_paid
+        ret = ((px - entry) / entry) * pos
+        base = equity if compound else start_equity
+        pnl = base * leverage * ret
+        equity += pnl
+        f = base * leverage * cost
+        equity -= f
+        fees_paid += f
+        trades.append({"entry": entry, "exit": px, "ret": ret, "pnl": pnl,
+                       "bars": i, "lev": leverage})
 
-        if not in_pos and score >= enter_score:
-            in_pos = True
-            entry_px = px * (1 + cost)        # pay fee+slippage on entry
-            entry_eq = equity if compound else start_equity
-            entry_bar = i
-            fees_paid += entry_eq * cost
-        elif in_pos and score <= exit_score:
-            exit_px = px * (1 - cost)         # pay fee+slippage on exit
-            gross_ret = exit_px / entry_px - 1
-            pnl = entry_eq * gross_ret
-            equity += pnl
-            fees_paid += entry_eq * cost
-            trades.append({"entry": entry_px, "exit": exit_px, "ret": gross_ret,
-                           "pnl": pnl, "bars": i - entry_bar})
-            in_pos = False
-        # mark-to-market equity curve
-        if in_pos:
-            mtm = entry_eq * (px / entry_px - 1)
-            curve.append((equity if not compound else equity) + 0)  # realized only
-        else:
-            curve.append(equity)
+    for i in range(warmup, n):
+        px = closes[i]
 
-    return BacktestResult(curve, trades, fees_paid,
-                          {"enter_score": enter_score, "exit_score": exit_score,
-                           "fee_bps": fee_bps, "slippage_bps": slippage_bps,
-                           "compound": compound})
+        # liquidation check on the open leveraged position
+        if pos != 0 and leverage > 1.0:
+            adverse = ((entry - px) / entry) if pos > 0 else ((px - entry) / entry)
+            if adverse >= maint:
+                base = equity if compound else start_equity
+                equity -= base                      # margin wiped
+                equity = max(equity, 0.0)
+                trades.append({"entry": entry, "exit": px, "ret": -1.0,
+                               "pnl": -base, "bars": i, "lev": leverage,
+                               "liquidated": True})
+                liquidations += 1
+                pos = 0
+                curve.append(equity)
+                if equity <= start_equity * 0.01:
+                    break
+                continue
+
+        target = signal_fn(cache, i)
+        if not allow_short and target < 0:
+            target = 0
+        if target != pos:
+            if pos != 0:
+                close(px, i)
+            if target != 0 and equity > 0:
+                entry = px
+                base = equity if compound else start_equity
+                f = base * leverage * cost
+                equity -= f
+                fees_paid += f
+            pos = target
+        curve.append(equity)
+
+    if pos != 0 and equity > 0:
+        close(closes[-1], n)
+
+    res = BacktestResult(curve, trades, fees_paid,
+                         {"leverage": leverage, "fee_bps": fee_bps,
+                          "slippage_bps": slippage_bps, "compound": compound,
+                          "allow_short": allow_short})
+    res.liquidations = liquidations
+    return res
+
+
+def compare(candles, strat_registry, *, leverage=1.0, **kw):
+    """Run every strategy, return a leaderboard ranked by Sharpe then return."""
+    from . import strats
+    cache = strats.precompute(candles)      # compute indicators ONCE for all
+    rows = []
+    for name, fn in strat_registry.items():
+        try:
+            r = run_signal(cache, fn, leverage=leverage, **kw)
+            s = r.stats()
+            s["strategy"] = name
+            s["liquidations"] = getattr(r, "liquidations", 0)
+            rows.append(s)
+        except Exception as e:
+            rows.append({"strategy": name, "error": str(e), "sharpe": -99,
+                         "total_return_pct": -100})
+    rows.sort(key=lambda x: (x.get("sharpe", -99), x.get("total_return_pct", -100)),
+              reverse=True)
+    return rows
+
+
+def print_leaderboard(symbol, interval, rows, leverage, n_candles):
+    print(f"\n=== Strategy leaderboard {symbol} {interval} "
+          f"({n_candles} candles, {leverage}x leverage) ===")
+    print(f"  {'strategy':<18}{'return%':>9}{'sharpe':>8}{'win%':>7}"
+          f"{'PF':>7}{'maxDD%':>8}{'trades':>8}{'liq':>5}")
+    for r in rows:
+        if "error" in r:
+            print(f"  {r['strategy']:<18}  ERROR: {r['error'][:40]}")
+            continue
+        pf = r["profit_factor"]
+        print(f"  {r['strategy']:<18}{r['total_return_pct']:>9}{r['sharpe']:>8}"
+              f"{r['win_rate_pct']:>7}{(pf if pf is not None else 0):>7}"
+              f"{r['max_drawdown_pct']:>8}{r['trades']:>8}{r.get('liquidations',0):>5}")
+    print("  ranked by Sharpe. 'liq' = liquidations (>0 means leverage blew it up).")
+    print("  IN-SAMPLE ONLY — the top row is a hypothesis, not a deployable edge.")
 
 
 def print_report(symbol, interval, result, n_candles):

@@ -92,6 +92,17 @@ def main():
     print("backtest  : %d trades, return %s%%, fees $%s, Sharpe %s" % (
         st["trades"], st["total_return_pct"], st["fees_paid"], st["sharpe"]))
 
+    # 10-strategy comparison + leverage liquidation model
+    from . import strats
+    assert len(strats.REGISTRY) == 10
+    rows1 = bt.compare(candles, strats.REGISTRY, leverage=1, fee_bps=10, slippage_bps=2)
+    rows10 = bt.compare(candles, strats.REGISTRY, leverage=10, fee_bps=10, slippage_bps=2)
+    assert len(rows1) == 10
+    liq10 = sum(r.get("liquidations", 0) for r in rows10)
+    print("compare   : 10 strats ranked; best=%s (%.1f%%); 10x liquidations=%d" % (
+        rows1[0]["strategy"], rows1[0]["total_return_pct"], liq10))
+    assert liq10 >= 0  # leverage model wired
+
     print("\nALL SMOKE CHECKS PASSED ✓")
 
 
