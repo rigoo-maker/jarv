@@ -1,5 +1,12 @@
-# Generated dashboard output
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Generated dashboards & runtime artifacts
 crypto_dashboard.html
+krypt_dashboard.html
+krypt_audit.jsonl
 
 # Python
 __pycache__/

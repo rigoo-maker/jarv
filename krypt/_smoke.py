@@ -1,0 +1,80 @@
+"""Offline smoke test — exercises indicators, scoring, risk, trader (paper),
+and dashboard rendering on synthetic data, with NO network. Run:
+
+    python3 -m krypt._smoke
+"""
+
+from __future__ import annotations
+
+from .config import load_config
+from . import indicators
+from .scoring import score_snapshot
+from .risk import RiskEngine
+from .trader import Trader
+from .alerts import default_rules
+from . import dashboard
+
+
+def synth(n=240, start=60000.0):
+    out, price, st = [], start, 12345
+    for i in range(n):
+        st = (1103515245 * st + 12345) & 0x7FFFFFFF
+        r = st / 0x7FFFFFFF - 0.5
+        price *= 1 + 0.0006 + 0.02 * r
+        o = price
+        c = price * (1 + 0.01 * r)
+        out.append({"time": 1_700_000_000_000 + i * 60000, "open": o,
+                    "high": max(o, c) * 1.002, "low": min(o, c) * 0.998,
+                    "close": c, "volume": 10 + 50 * abs(r)})
+        price = c
+    return out
+
+
+def main():
+    cfg = load_config(mode="paper")
+    candles = synth()
+    ind = indicators.compute_all(candles)
+    snap = ind["latest"]
+    sc = score_snapshot(snap)
+    print("indicators latest:",
+          {k: (round(v, 2) if isinstance(v, float) else v) for k, v in snap.items()})
+    print("score:", sc["score"], sc["label"])
+    assert -100 <= sc["score"] <= 100
+    assert all(v is not None for v in (snap["rsi"], snap["macd"], snap["atr"], snap["vwap"]))
+
+    # risk + trader (paper) — no client needed for analyze/paper buy/sell
+    risk = RiskEngine(limits=cfg.risk)
+    trader = Trader(cfg, client=None, risk=risk)
+    price = snap["price"]
+    r1 = trader.execute("BTCUSDT", "BUY", price, notional_usd=40, reason="smoke")
+    r2 = trader.execute("BTCUSDT", "SELL", price * 1.01, notional_usd=40, reason="smoke")
+    print("paper buy :", r1["event"])
+    print("paper sell:", r2["event"], "pnl", r2.get("realized_pnl"))
+    assert r1["event"] == "paper_fill" and r2["event"] == "paper_fill"
+
+    # risk rejection: order over max
+    rej = trader.execute("BTCUSDT", "BUY", price, notional_usd=999999, reason="too big")
+    print("oversize  :", rej["event"], "-", rej.get("risk"))
+    assert rej["event"] == "rejected"
+
+    # alerts
+    al = default_rules("BTCUSDT")
+    fired = al.check("BTCUSDT", {"rsi": 80, "score": 70})
+    print("alerts    :", [a["metric"] for a in fired])
+
+    # dashboard renders
+    state = {"symbol": "BTCUSDT", "price": price, "mode": "paper", "testnet": True,
+             "candles": candles[-120:], "ema21": ind["ema21"][-120:],
+             "scoring": sc, "book": {"imbalance": 0.1, "spread": 1.2,
+             "best_bid": price, "best_ask": price * 1.0001},
+             "risk": risk.snapshot(), "alerts": fired}
+    html = dashboard.render(state)
+    assert "KRYPT Trader" in html and "lightweight-charts" in html
+    with open("krypt_dashboard.html", "w") as f:
+        f.write(html)
+    print("dashboard : wrote krypt_dashboard.html (%d bytes)" % len(html))
+    print("\nALL SMOKE CHECKS PASSED ✓")
+
+
+if __name__ == "__main__":
+    main()
