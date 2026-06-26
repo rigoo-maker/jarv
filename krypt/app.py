@@ -25,8 +25,9 @@ from .trader import Trader
 from .alerts import default_rules
 from .strategies import make_strategy
 from .engine import Engine
-from . import dashboard, live_dashboard, indicators
+from . import dashboard, live_dashboard, indicators, data as datamod, backtest as bt
 from .scoring import score_snapshot
+from datetime import date, timedelta
 
 
 def build(cfg):
@@ -112,37 +113,44 @@ def cmd_serve(cfg, port):
         print("\nstopped.")
 
 
-def cmd_backtest(cfg, limit):
-    """Simple long/flat backtest of the scoring engine on historical candles."""
-    client = BinanceClient(cfg)
+def cmd_download(cfg, days, kind):
+    """Bulk-download historical data from data.binance.vision."""
     sym = cfg.symbols[0]
-    candles = client.klines(sym, cfg.interval, min(limit, 1000))
-    equity, pos_qty, entry = 1000.0, 0.0, 0.0
-    trades, wins = 0, 0
-    peak, max_dd = equity, 0.0
-    for i in range(60, len(candles)):
-        window = candles[:i + 1]
-        snap = indicators.compute_all(window)["latest"]
-        sc = score_snapshot(snap)["score"]
-        price = window[-1]["close"]
-        if pos_qty == 0 and sc >= 35:
-            pos_qty = equity / price
-            entry = price
-        elif pos_qty > 0 and sc <= -10:
-            pnl = (price - entry) * pos_qty
-            equity += pnl
-            trades += 1
-            wins += 1 if pnl > 0 else 0
-            pos_qty = 0.0
-        peak = max(peak, equity)
-        max_dd = max(max_dd, (peak - equity) / peak * 100)
-    if pos_qty > 0:
-        equity += (candles[-1]["close"] - entry) * pos_qty
-    print(f"Backtest {sym} {cfg.interval} ({len(candles)} candles)")
-    print(f"  final equity : ${equity:,.2f}  ({(equity/1000-1)*100:+.1f}%)")
-    print(f"  trades       : {trades}  win rate {100*wins/trades if trades else 0:.0f}%")
-    print(f"  max drawdown : {max_dd:.1f}%")
-    print("  (toy backtest, no fees/slippage — do not trust it with real money)")
+    end = date.today() - timedelta(days=1)        # yesterday is the last full day
+    start = end - timedelta(days=days - 1)
+    print(f"Downloading {kind} for {sym} {start}..{end} from data.binance.vision")
+    if kind == "klines":
+        candles = datamod.download_klines_range(sym, cfg.interval, start, end)
+        print(f"✓ {len(candles)} candles cached in ./data (interval {cfg.interval})")
+    else:
+        total = 0
+        for d in [start + timedelta(n) for n in range((end - start).days + 1)]:
+            try:
+                ticks = datamod.load_aggtrades_day(sym, d)
+                total += len(ticks)
+                print(f"  {d}  +{len(ticks):,} ticks (total {total:,})")
+            except RuntimeError as e:
+                print(f"  {d}  skipped: {e}")
+        print(f"✓ {total:,} ticks (aggTrades). Resample with data.ticks_to_candles().")
+
+
+def cmd_backtest(cfg, days, limit, fee_bps, slippage_bps, no_compound):
+    """Realistic backtest over historical klines (bulk download if available)."""
+    sym = cfg.symbols[0]
+    if days:
+        end = date.today() - timedelta(days=1)
+        start = end - timedelta(days=days - 1)
+        print(f"Loading {sym} {cfg.interval} {start}..{end} (data.binance.vision)")
+        candles = datamod.download_klines_range(sym, cfg.interval, start, end)
+    else:
+        client = BinanceClient(cfg)
+        candles = client.klines(sym, cfg.interval, min(limit, 1000))
+    if len(candles) < 80:
+        print("not enough candles to backtest.", file=sys.stderr)
+        sys.exit(1)
+    result = bt.run(candles, fee_bps=fee_bps, slippage_bps=slippage_bps,
+                    compound=not no_compound)
+    bt.print_report(sym, cfg.interval, result, len(candles))
 
 
 def cmd_live(cfg, exchange):
@@ -157,7 +165,7 @@ def cmd_live(cfg, exchange):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
-    p.add_argument("command", choices=["analyze", "serve", "backtest", "live"])
+    p.add_argument("command", choices=["analyze", "serve", "backtest", "live", "download"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
@@ -165,6 +173,11 @@ def main(argv=None):
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--limit", type=int, default=500)
     p.add_argument("--exchange", choices=["binance", "coinbase"], default="binance")
+    p.add_argument("--days", type=int, help="history window (download/backtest)")
+    p.add_argument("--kind", choices=["klines", "aggTrades"], default="klines")
+    p.add_argument("--fee-bps", type=float, default=10.0, help="per-side taker fee bps")
+    p.add_argument("--slippage-bps", type=float, default=2.0)
+    p.add_argument("--no-compound", action="store_true", help="disable equity compounding")
     args = p.parse_args(argv)
 
     cfg = load_config(mode=args.mode, symbols=args.symbols,
@@ -181,7 +194,10 @@ def main(argv=None):
         elif args.command == "serve":
             cmd_serve(cfg, args.port)
         elif args.command == "backtest":
-            cmd_backtest(cfg, args.limit)
+            cmd_backtest(cfg, args.days, args.limit, args.fee_bps,
+                         args.slippage_bps, args.no_compound)
+        elif args.command == "download":
+            cmd_download(cfg, args.days or 21, args.kind)
         elif args.command == "live":
             cmd_live(cfg, args.exchange)
     except BinanceError as e:

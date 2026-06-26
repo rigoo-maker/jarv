@@ -73,6 +73,25 @@ def main():
     with open("krypt_dashboard.html", "w") as f:
         f.write(html)
     print("dashboard : wrote krypt_dashboard.html (%d bytes)" % len(html))
+
+    # tick -> candle resampling
+    from . import data as datamod
+    ticks = []
+    for i in range(2000):
+        ticks.append({"time": 1_700_000_000_000 + i * 500, "price": 60000 + i,
+                      "qty": 0.01, "is_buyer_maker": i % 2 == 0})
+    bars = datamod.ticks_to_candles(ticks, bucket_secs=1)
+    assert bars and all(b["high"] >= b["low"] for b in bars)
+    print("resample  : %d ticks -> %d 1s candles" % (len(ticks), len(bars)))
+
+    # realistic backtester runs and reports
+    from . import backtest as bt
+    res = bt.run(candles, fee_bps=10, slippage_bps=2, compound=True)
+    st = res.stats()
+    assert "final_equity" in st and st["max_drawdown_pct"] >= 0
+    print("backtest  : %d trades, return %s%%, fees $%s, Sharpe %s" % (
+        st["trades"], st["total_return_pct"], st["fees_paid"], st["sharpe"]))
+
     print("\nALL SMOKE CHECKS PASSED ✓")
 
 
