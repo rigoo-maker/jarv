@@ -36,8 +36,30 @@ cp .env.example .env        # then edit .env with your keys + limits
 set -a; source .env; set +a
 ```
 
-No third-party dependencies — pure Python 3 standard library. (The dashboard
-loads TradingView lightweight-charts from a CDN in the browser.)
+Core (data, indicators, scoring, backtest, paper, dashboards) is **pure stdlib**.
+Live trading on **Coinbase** additionally needs `pip install PyJWT cryptography`.
+
+## Execution venues (`KRYPT_VENUE`)
+
+KRYPT separates **data** (always free/public) from **execution** (where orders go).
+
+| Venue | Auth | Testnet (fake money) | Deps |
+|-------|------|----------------------|------|
+| `binance` | HMAC-SHA256 | ✅ yes (default-on) | none |
+| `coinbase` | JWT / ES256 (CDP key) | ❌ **none** — use `KRYPT_MODE=paper` | PyJWT, cryptography |
+
+```bash
+# Route live orders to Coinbase Advanced Trade
+export KRYPT_VENUE=coinbase
+export COINBASE_API_KEY_NAME='organizations/<org>/apiKeys/<uuid>'
+export COINBASE_API_PRIVATE_KEY='-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----'
+python3 -m krypt.app serve --mode paper      # SIMULATE first (Coinbase has no testnet)
+```
+
+> ⚠️ **Coinbase has no fake-money testnet** for this path, so `live` mode there is
+> **real money immediately**. Prove your strategy in `--mode paper` (simulated fills
+> against live prices) before ever switching to `live`. Keys come from env only —
+> never hardcoded, never committed, never pasted into chat.
 
 ## Usage
 

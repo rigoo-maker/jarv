@@ -31,9 +31,13 @@ from datetime import date, timedelta
 
 
 def build(cfg):
-    client = BinanceClient(cfg)
+    client = BinanceClient(cfg)              # public data (klines/order book)
+    exec_client = client
+    if cfg.venue == "coinbase":
+        from .coinbase_client import CoinbaseClient
+        exec_client = CoinbaseClient(cfg)    # live orders routed here
     risk = RiskEngine(limits=cfg.risk)
-    trader = Trader(cfg, client, risk)
+    trader = Trader(cfg, client, risk, exec_client=exec_client)
     strat = make_strategy(cfg.strategy, cfg, client)
     alerts = default_rules(cfg.symbols[0])
     return client, risk, trader, strat, alerts, Engine(cfg, client, strat, trader, risk, alerts)
@@ -170,6 +174,7 @@ def main(argv=None):
     p.add_argument("--symbols")
     p.add_argument("--interval")
     p.add_argument("--strategy", choices=["scalper", "market_maker", "hedge", "trend"])
+    p.add_argument("--venue", choices=["binance", "coinbase"], help="execution venue")
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--limit", type=int, default=500)
     p.add_argument("--exchange", choices=["binance", "coinbase"], default="binance")
@@ -181,7 +186,7 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     cfg = load_config(mode=args.mode, symbols=args.symbols,
-                      interval=args.interval, strategy=args.strategy)
+                      interval=args.interval, strategy=args.strategy, venue=args.venue)
     try:
         cfg.assert_live_allowed()
     except PermissionError as e:

@@ -65,9 +65,16 @@ class Config:
     allow_live: bool = False             # second lock for live (env KRYPT_ALLOW_LIVE)
     testnet: bool = True                 # live orders go to Binance testnet by default
 
-    # --- credentials (live/paper account reads) ---
+    # --- execution venue ---
+    venue: str = "binance"               # binance | coinbase (where orders go)
+
+    # --- Binance credentials ---
     api_key: str = ""
     api_secret: str = ""
+
+    # --- Coinbase Advanced Trade credentials (JWT/ES256) ---
+    cb_key_name: str = ""                # organizations/<org>/apiKeys/<uuid>
+    cb_private_key: str = ""             # EC PRIVATE KEY PEM (\n allowed)
 
     # --- universe & cadence ---
     symbols: list = field(default_factory=lambda: ["BTCUSDT"])
@@ -102,18 +109,29 @@ class Config:
             raise PermissionError(
                 "LIVE mode requires the second lock. Set env KRYPT_ALLOW_LIVE=1 "
                 "to confirm you intend to place REAL orders. Refusing to trade.")
-        if not (self.api_key and self.api_secret):
+        if self.venue == "coinbase":
+            if not (self.cb_key_name and self.cb_private_key):
+                raise PermissionError(
+                    "LIVE mode on Coinbase needs COINBASE_API_KEY_NAME and "
+                    "COINBASE_API_PRIVATE_KEY in the environment. None found.")
+        elif not (self.api_key and self.api_secret):
             raise PermissionError(
-                "LIVE mode needs BINANCE_API_KEY and BINANCE_API_SECRET in the "
-                "environment. None found.")
+                "LIVE mode on Binance needs BINANCE_API_KEY and BINANCE_API_SECRET "
+                "in the environment. None found.")
 
     def banner(self) -> str:
-        net = "TESTNET (fake money)" if self.testnet else "MAINNET (REAL money)"
+        if self.venue == "coinbase":
+            # Coinbase Advanced Trade has no fake-money testnet for KRYPT's path;
+            # use mode=paper to simulate. Live on Coinbase = REAL money, always.
+            net = "Coinbase LIVE (REAL money)" if self.mode == "live" else "Coinbase"
+        else:
+            net = "TESTNET (fake money)" if self.testnet else "MAINNET (REAL money)"
         warn = ""
-        if self.mode == "live" and not self.testnet:
+        if self.mode == "live" and (self.venue == "coinbase" or not self.testnet):
             warn = "  <<< REAL FUNDS AT RISK >>>"
-        return (f"mode={self.mode.upper()}  net={net}  strategy={self.strategy}  "
-                f"symbols={','.join(self.symbols)}  interval={self.interval}{warn}")
+        return (f"mode={self.mode.upper()}  venue={self.venue}  net={net}  "
+                f"strategy={self.strategy}  symbols={','.join(self.symbols)}  "
+                f"interval={self.interval}{warn}")
 
     def safe_dict(self) -> dict:
         d = asdict(self)
@@ -129,8 +147,11 @@ def load_config(**overrides) -> Config:
         mode=os.environ.get("KRYPT_MODE", "analyze").lower(),
         allow_live=_b("KRYPT_ALLOW_LIVE", False),
         testnet=_b("BINANCE_TESTNET", True),
+        venue=os.environ.get("KRYPT_VENUE", "binance").lower(),
         api_key=os.environ.get("BINANCE_API_KEY", ""),
         api_secret=os.environ.get("BINANCE_API_SECRET", ""),
+        cb_key_name=os.environ.get("COINBASE_API_KEY_NAME", ""),
+        cb_private_key=os.environ.get("COINBASE_API_PRIVATE_KEY", ""),
         symbols=[s.strip().upper() for s in
                  os.environ.get("KRYPT_SYMBOLS", "BTCUSDT").split(",") if s.strip()],
         interval=os.environ.get("KRYPT_INTERVAL", "1m"),

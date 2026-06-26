@@ -17,9 +17,11 @@ import time
 
 
 class Trader:
-    def __init__(self, cfg, client, risk, audit_path="krypt_audit.jsonl"):
+    def __init__(self, cfg, client, risk, audit_path="krypt_audit.jsonl",
+                 exec_client=None):
         self.cfg = cfg
-        self.client = client
+        self.client = client            # data client (Binance public)
+        self.exec_client = exec_client or client   # where live orders go
         self.risk = risk
         self.audit_path = audit_path
         cfg.assert_live_allowed()  # fail fast before any trading happens
@@ -61,13 +63,13 @@ class Trader:
                                 "notional_usd": round(notional_usd, 2),
                                 "realized_pnl": round(realized, 4), "reason": reason})
 
-        # ---- live ----
+        # ---- live ---- (routed to the configured venue)
         try:
             if side == "BUY":
-                resp = self.client.new_order(symbol, "BUY", "MARKET",
-                                             quote_qty=notional_usd)
+                resp = self.exec_client.new_order(symbol, "BUY", "MARKET",
+                                                  quote_qty=notional_usd)
             else:
-                resp = self.client.new_order(symbol, "SELL", "MARKET", quantity=qty)
+                resp = self.exec_client.new_order(symbol, "SELL", "MARKET", quantity=qty)
             # best-effort fill price/qty from response
             fill_price = price
             fill_qty = qty
@@ -79,11 +81,15 @@ class Trader:
                     fill_price = tot_c / tot_q
                     fill_qty = tot_q
             realized = self.risk.on_fill(symbol, side, fill_qty, fill_price)
+            order_id = (resp.get("orderId")
+                        or (resp.get("success_response") or {}).get("order_id")
+                        or resp.get("order_id"))
             return self._audit({"event": "live_fill", "symbol": symbol, "side": side,
+                                "venue": self.cfg.venue,
                                 "price": fill_price, "qty": round(fill_qty, 8),
                                 "notional_usd": round(fill_qty * fill_price, 2),
                                 "realized_pnl": round(realized, 4),
-                                "order_id": resp.get("orderId"), "reason": reason})
+                                "order_id": order_id, "reason": reason})
         except Exception as e:
             return self._audit({"event": "live_error", "symbol": symbol, "side": side,
                                 "error": str(e), "reason": reason})
