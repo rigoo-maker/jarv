@@ -25,7 +25,7 @@ from .trader import Trader
 from .alerts import default_rules
 from .strategies import make_strategy
 from .engine import Engine
-from . import dashboard, indicators
+from . import dashboard, live_dashboard, indicators
 from .scoring import score_snapshot
 
 
@@ -145,15 +145,26 @@ def cmd_backtest(cfg, limit):
     print("  (toy backtest, no fees/slippage — do not trust it with real money)")
 
 
+def cmd_live(cfg, exchange):
+    """Write a standalone live-tick dashboard (browser connects to exchange WS)."""
+    sym = cfg.symbols[0]
+    html = live_dashboard.render(sym, exchange)
+    with open("krypt_live.html", "w") as f:
+        f.write(html)
+    print(f"✓ wrote krypt_live.html — open it in a browser to stream live {sym} "
+          f"ticks from {exchange} (no key, no backend).")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
-    p.add_argument("command", choices=["analyze", "serve", "backtest"])
+    p.add_argument("command", choices=["analyze", "serve", "backtest", "live"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
     p.add_argument("--strategy", choices=["scalper", "market_maker", "hedge", "trend"])
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--exchange", choices=["binance", "coinbase"], default="binance")
     args = p.parse_args(argv)
 
     cfg = load_config(mode=args.mode, symbols=args.symbols,
@@ -171,6 +182,8 @@ def main(argv=None):
             cmd_serve(cfg, args.port)
         elif args.command == "backtest":
             cmd_backtest(cfg, args.limit)
+        elif args.command == "live":
+            cmd_live(cfg, args.exchange)
     except BinanceError as e:
         print(f"\nDATA ERROR: {e}\n"
               "If Binance is blocked on this network (sandbox/firewall), run KRYPT\n"
