@@ -292,6 +292,60 @@ def main():
     print("propfirm  : Apex trails unrealized + locks at start+100; Topstep trails "
           "EOD + DLL;\n            overnight holds fail; size sweep runs")
 
+    # hybrid combinators
+    from . import hybrids as hyb
+    a = [0, 1, 1, 0, 1]
+    b = [0, 0, 1, 1, 1]
+    assert hyb.combine_and([a, b]) == [0, 0, 1, 0, 1]
+    assert hyb.combine_or([a, b]) == [0, 1, 1, 1, 1]
+    assert hyb.combine_vote([a, b, a], 2) == [0, 1, 1, 0, 1]
+    sw = hyb.combine_switch(ecache, [1] * len(daily), [0] * len(daily))
+    assert set(sw) <= {0, 1} and len(sw) == len(daily)
+    pool = {n: ana.position_series(ecache, f, warmup=100, allow_short=False)
+            for n, f in list(eqlib.registry(ecache).items())[:4]}
+    hrows, hmat = hyb.search_pairs(ecache, pool, bpy=365, warmup=100,
+                                   modes=("and", "or"), min_trades=1)
+    assert hmat["and"]["matrix"][0][1] == hmat["and"]["matrix"][1][0]  # symmetric
+    assert all(set(r["positions"]) <= {0, 1} for r in hrows)
+    print("hybrids   : and/or/vote/switch combine correctly; %d pair results, "
+          "AND grid symmetric" % len(hrows))
+
+    # validation: the permutation test must have the right sign and no false power
+    from . import validate as va
+    closes = [c["close"] for c in daily]
+    mkt = [0.0] + [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+    perfect = [0] * len(daily)                 # long only before up days: cheating
+    for i in range(len(daily) - 1):
+        if mkt[i + 1] > 0:
+            perfect[i] = 1
+    cheat = va.rotation_pvalue(perfect, mkt, 365, warmup=50, samples=400)
+    assert cheat["p_value"] <= 0.01, cheat     # real timing must be detected
+    always = va.rotation_pvalue([1] * len(daily), mkt, 365, warmup=50, samples=400)
+    assert always["p_value"] == 1.0 and "constant" in always.get("note", "")
+    import random as _r
+    rng = _r.Random(3)
+    noise = [1 if rng.random() < 0.3 else 0 for _ in daily]
+    npv = va.rotation_pvalue(noise, mkt, 365, warmup=50, samples=400)["p_value"]
+    assert 0.02 < npv < 0.98, npv              # random timing must NOT look special
+
+    rej, adj = va.benjamini_hochberg([0.001, 0.20, 0.60], alpha=0.05)
+    assert adj == sorted(adj) and rej[0] and not rej[2]
+    _, adj_wide = va.benjamini_hochberg([0.001], alpha=0.05, m_total=400)
+    assert adj_wide[0] > 0.05                  # correcting for the whole search bites
+
+    # next-bar-open fills must differ from close fills, and duplicates collapse
+    dl = va.delayed_returns(daily, perfect, 0.0)
+    cl = va.close_returns(daily, perfect, 0.0)
+    assert dl != cl
+    g = va.gauntlet(daily, {"a": perfect, "a_copy": list(perfect),
+                            "flat": [0] * len(daily)},
+                    bpy=365, warmup=50, samples=400, m_total=3)
+    dupes = [r for r in g["rows"] if r.get("duplicate_of")]
+    assert len(dupes) == 1 and dupes[0]["duplicate_of"] == "a"
+    print("validate  : cheating timing p<=0.01, random timing not special, "
+          "constant exposure\n            p=1.0, BH corrects for the search, "
+          "duplicates collapse")
+
     print("\nALL SMOKE CHECKS PASSED ✓")
 
 

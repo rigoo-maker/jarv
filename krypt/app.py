@@ -37,6 +37,8 @@ from . import ninjascript as nj
 from . import csvdata
 from . import strats_equity as eqlib
 from . import propfirm as prop
+from . import hybrids as hyb
+from . import validate as val
 from .scoring import score_snapshot
 from datetime import date, timedelta
 
@@ -406,6 +408,151 @@ def cmd_prop(cfg, days, limit, args):
               "(informative, but not a result you can trade at a prop firm).")
 
 
+def cmd_discover(cfg, days, limit, args):
+    """Search -> sweep -> hybrids -> proof, in one pass.
+
+    The pipeline is deliberately ordered so each stage cannot cheat the next:
+    parameters are chosen IN-SAMPLE, hybrids are built from those choices, and
+    everything is judged out-of-sample and against a multiple-testing correction
+    that counts every hypothesis the run explored.
+    """
+    candles = _load_candles(cfg, days, limit, args)
+    info = _load_candles.last_info
+    cache, registry, base_pos = _positions_for(candles, args, info)
+    warmup = 300 if args.strats == "equity" else 60
+    bpy = ana.empirical_bars_per_year(candles, (info or {}).get("interval") or cfg.interval)
+    cost = (args.fee_bps + args.slippage_bps) / 1e4
+    A = ana.Analysis(args.symbols or "series", (info or {}).get("interval") or cfg.interval,
+                     candles, registry, windows=args.windows, fee_bps=args.fee_bps,
+                     slippage_bps=args.slippage_bps, allow_short=False,
+                     warmup=warmup, cache=cache, extras=(info or {}).get("extras"),
+                     oos_frac=args.oos_frac)
+    split = A._split()
+    hypotheses = 0
+
+    # ---- 1. sweep every rule's grid, and pick each rule's best cell IN-SAMPLE
+    specs = (eqlib.sweep_specs(cache) if args.strats == "equity" else {})
+    tuned, sweeps = {}, []
+    if specs:
+        print(f"Sweeping {len(specs)} parameter grids (in-sample selection) ...")
+        for name, spec in specs.items():
+            grid = A.sweep_grid(name, spec, in_sample_only=True)
+            sweeps.append(grid)
+            best, best_key = None, None
+            for row in grid["rows"]:
+                for cell in row["cells"]:
+                    hypotheses += 1
+                    if best is None or cell["ann_sharpe"] > best:
+                        best, best_key = cell["ann_sharpe"], cell["params"]
+            if best_key is not None:
+                tuned[f"{name}*"] = spec["make"](cache, best_key["x"], best_key["y"])
+                print(f"  {name:<20} best in-sample cell: "
+                      f"{best_key['x']}/{best_key['y']}  (Sharpe {best})")
+
+    # ---- 2. hybrids from the tuned rules
+    pool = dict(base_pos)
+    pool.update(tuned)
+    print(f"\nCombining {len(tuned) or len(base_pos)} rules into hybrids ...")
+    source = tuned or base_pos
+    rows, matrices = hyb.search_pairs(cache, source, bpy=bpy, warmup=warmup,
+                                      split=split, fee_bps=args.fee_bps,
+                                      slippage_bps=args.slippage_bps)
+    votes = hyb.search_votes(cache, source, bpy=bpy, warmup=warmup, split=split,
+                             fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
+    rows.extend(votes)
+    hypotheses += len(rows)
+
+    bench_pos = [1] * len(candles)
+    bench = hyb.evaluate_positions(cache, bench_pos, bpy=bpy, warmup=warmup,
+                                   split=split, fee_bps=args.fee_bps,
+                                   slippage_bps=args.slippage_bps)
+    hyb.print_hybrids(rows, benchmark=bench, top=args.top)
+
+    # ---- 3. portfolios of whatever ranked best out-of-sample
+    singles = {n: hyb.evaluate_positions(cache, p, bpy=bpy, warmup=warmup,
+                                         split=split, fee_bps=args.fee_bps,
+                                         slippage_bps=args.slippage_bps)
+               for n, p in source.items()}
+    ranked = sorted(singles, key=lambda n: singles[n]["oos_sharpe"], reverse=True)
+    ports = hyb.build_portfolios(cache, source, ranked, bpy=bpy, warmup=warmup,
+                                 cost=cost)
+    if ports:
+        print("\n  equal-weight portfolios (capital split, daily rebalance — "
+              "combines equity curves, not signals):")
+        for pf in ports:
+            print(f"    {pf['name']:<22} return {pf['return_pct']:>8.1f}%  "
+                  f"Sharpe {pf['full_sharpe']:>5.2f}  maxDD {pf['max_dd_pct']:>5.1f}%"
+                  f"   [{', '.join(pf['members'])}]")
+
+    # ---- 4. the gauntlet, on a shortlist, corrected for everything explored
+    # Base rules AND their tuned variants go in: the gap between them is the
+    # clearest read on how much of a "discovery" is just parameter selection.
+    shortlist = dict(base_pos)
+    shortlist.update(source)
+    for r in rows[:args.top]:
+        shortlist[r["name"]] = r["positions"]
+    shortlist["buy_hold"] = bench_pos
+    res = val.gauntlet(candles, shortlist, bpy=bpy, warmup=warmup, cost=cost,
+                       samples=args.permutations, benchmark=bench["full_sharpe"],
+                       m_total=hypotheses, oos_start=split)
+    val.print_gauntlet(res, top=args.top)
+
+    survivors = [r for r in res["rows"] if r["verdict"].startswith("SURVIVES")]
+    print("\n=== WHAT TO TAKE TO NINJATRADER ===")
+    if survivors:
+        # Eleven survivors that all contain the same rule are one finding with
+        # eleven names. Say so, or the count reads as eleven independent edges.
+        counts = {}
+        for r in survivors:
+            for m in (r["name"].replace(" SWITCH ", " ").replace(" AND ", " ")
+                      .replace(" OR ", " ").split()):
+                counts[m] = counts.get(m, 0) + 1
+        common = [m for m, c in counts.items() if c >= max(2, 0.8 * len(survivors))]
+        if common and len(survivors) > 1:
+            print(f"  READ THIS FIRST: {len(survivors)} survivors, but every one "
+                  f"contains {', '.join(common)} —\n  that is ONE finding wearing "
+                  f"{len(survivors)} names. The combinations around it mostly "
+                  f"change\n  exposure, not edge.")
+        for r in survivors[:5]:
+            print(f"  {r['name']}  (Sharpe {r['close_sharpe']} close / "
+                  f"{r['delayed_sharpe']} next-open, p_adj {r['p_adjusted']}, "
+                  f"exposure {r['exposure']*100:.0f}%)")
+        base_only = [r for r in survivors if r["name"] in base_pos]
+        if not base_only:
+            print("  NOTE: no UNTUNED rule survived — only parameter-tuned variants "
+                  "did. Tuning\n  on this sample and testing on the same sample is "
+                  "exactly what the correction\n  is trying to catch, so treat "
+                  "these as candidates for a fresh date range,\n  not as proven.")
+        print("  Export with: python3 -m krypt.app ninja --strategy <name> "
+              f"--strats {args.strats} --firm {args.firm} --prop")
+    else:
+        best = min(res["rows"], key=lambda r: (r["p_adjusted"], -r["close_sharpe"]))
+        print(f"  Nothing cleared the bar after correcting for "
+              f"{res['hypotheses']} explored hypotheses.")
+        print(f"  Closest: {best['name']} — raw p {best['p_value']:.5f}, adjusted "
+              f"{best['p_adjusted']} (needs <= {res['alpha']}),\n"
+              f"  held-out-tail p {best.get('p_oos')}, Sharpe "
+              f"{best['close_sharpe']} close / {best['delayed_sharpe']} next-open "
+              f"at {best['exposure']*100:.0f}% exposure\n"
+              f"  vs buy & hold {bench['full_sharpe']}.")
+        print("  That is a CANDIDATE, not an edge. The way it becomes one is a "
+              "different symbol\n  or date range, where it is a single hypothesis "
+              "instead of one of hundreds and\n  the same p-value would be "
+              "conclusive. Re-run: same command, different --file.")
+    report = A.run_all()
+    report["sweeps"] = sweeps or report.get("sweeps")
+    report["hybrids"] = {"rows": [{k: v for k, v in r.items() if k != "positions"}
+                                  for r in rows[:args.top]],
+                         "matrices": matrices, "benchmark": bench,
+                         "portfolios": ports}
+    report["validation"] = res
+    out = args.out or "krypt_discover.html"
+    with open(out, "w") as f:
+        f.write(heatmapmod.render(report))
+    print(f"\n>> wrote {out}")
+    return report
+
+
 def cmd_live(cfg, exchange):
     """Write a standalone live-tick dashboard (browser connects to exchange WS)."""
     sym = cfg.symbols[0]
@@ -420,7 +567,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
     p.add_argument("command",
                    choices=["analyze", "serve", "backtest", "compare", "heatmap",
-                            "prop", "ninja", "live", "download"])
+                            "discover", "prop", "ninja", "live", "download"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
@@ -472,6 +619,8 @@ def main(argv=None):
                    help="skip the pass-rate-by-size sweep")
     p.add_argument("--allow-overnight", action="store_true",
                    help="ignore the no-overnight rule (counterfactual only)")
+    p.add_argument("--permutations", type=int, default=200,
+                   help="permutation samples per candidate in the edge test")
     p.add_argument("--prop", action="store_true",
                    help="bake the --firm rules into the generated NinjaScript")
     p.add_argument("--no-analysis", action="store_true",
@@ -512,6 +661,8 @@ def main(argv=None):
         elif args.command == "compare":
             cmd_compare(cfg, args.days, args.limit, args.leverage,
                         args.fee_bps, args.slippage_bps, args.no_compound)
+        elif args.command == "discover":
+            cmd_discover(cfg, args.days, args.limit, args)
         elif args.command == "prop":
             cmd_prop(cfg, args.days, args.limit, args)
         elif args.command == "heatmap":

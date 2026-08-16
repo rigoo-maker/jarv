@@ -409,6 +409,132 @@ def _corr_section(rep, key, title, lede):
 </section>"""
 
 
+MODE_BLURB = {
+    "and": "Long only when BOTH rules are long — fewer trades, less exposure, and "
+           "the combination that most often improves risk-adjusted return when the "
+           "members are genuinely independent.",
+    "or": "Long when EITHER rule is long — more exposure, more trades, and a "
+          "steady drift toward buy-and-hold. Check the exposure column before "
+          "believing the return.",
+    "switch": "Row's rule above the 200-day line, column's rule below it. Not "
+              "symmetric: the diagonal halves are different strategies.",
+}
+
+
+def _hybrid_section(rep):
+    h = rep.get("hybrids")
+    if not h or not h.get("matrices"):
+        return ""
+    blocks = []
+    for mode, m in h["matrices"].items():
+        names = m["names"]
+        idx = list(range(len(names)))
+
+        def val(r, c, _m=m):
+            return _m["matrix"][r][c]
+
+        def tip(r, c, _m=m, _n=names, _mode=mode):
+            v = _m["matrix"][r][c]
+            return (f'{_n[r]} {_mode.upper()} {_n[c]}\n'
+                    f'out-of-sample Sharpe: {"—" if v is None else round(v, 2)}')
+        blocks.append(
+            f'<h3>{_esc(mode.upper())} — {_esc(MODE_BLURB[mode])}</h3>' +
+            _heat_table(rows=idx, cols=idx, value_of=val, tip_of=tip,
+                        label_of=lambda c, _n=names: _abbrev(_n[c].rstrip("*")),
+                        row_label=lambda r, _n=names: _n[r],
+                        col_title="", unit="", cell_fmt=2, compact=True))
+    bench = h.get("benchmark") or {}
+    rows = h.get("rows") or []
+    trs = "".join(
+        f'<tr><td class="name">{_esc(r["name"])}</td>'
+        f'<td class="num">{_fmt(r["full_sharpe"])}</td>'
+        f'<td class="num">{_fmt(r["oos_sharpe"])}</td>'
+        f'<td class="num">{_fmt(r["return_pct"], 1, "%")}</td>'
+        f'<td class="num">{_fmt(r["max_dd_pct"], 1, "%")}</td>'
+        f'<td class="num">{_fmt(100 * r.get("exposure", 0), 0, "%")}</td>'
+        f'<td class="num">{r.get("trades", 0)}</td></tr>' for r in rows)
+    ports = "".join(
+        f'<tr><td class="name">{_esc(p["name"])}</td>'
+        f'<td class="num">{_fmt(p["full_sharpe"])}</td><td class="num">—</td>'
+        f'<td class="num">{_fmt(p["return_pct"], 1, "%")}</td>'
+        f'<td class="num">{_fmt(p["max_dd_pct"], 1, "%")}</td>'
+        f'<td class="num">—</td><td class="num">—</td></tr>'
+        for p in (h.get("portfolios") or []))
+    return f"""
+<section class="card">
+  <h2>Hybrids — combining rules instead of picking one</h2>
+  <p class="lede">Each cell is a full backtest of two rules combined, colored by
+  <b>out-of-sample</b> Sharpe. Buy &amp; hold on the same bars:
+  {_fmt(bench.get("full_sharpe"))} full / {_fmt(bench.get("oos_sharpe"))} OOS.
+  Every cell is a separate hypothesis, and a grid this size always produces a
+  good-looking best cell — the validation table below is what decides whether any
+  of it is real.</p>
+  {''.join(blocks)}
+  <h3>Ranked combinations and portfolios</h3>
+  <div class="scroll"><table class="lb">
+    <thead><tr><th>combination</th><th class="num">full Sh</th>
+      <th class="num">OOS Sh</th><th class="num">return</th>
+      <th class="num">max DD</th><th class="num">exposure</th>
+      <th class="num">trades</th></tr></thead>
+    <tbody>{trs}{ports}</tbody></table></div>
+  <p class="note">Portfolios split capital equally and rebalance daily — they
+  combine equity curves rather than signals, so they only help when the members
+  are genuinely uncorrelated. They carry no exposure or trade count here because
+  they hold several rules at once.</p>
+</section>"""
+
+
+def _validation_section(rep):
+    v = rep.get("validation")
+    if not v or not v.get("rows"):
+        return ""
+    def badge(r):
+        if r["verdict"].startswith("SURVIVES"):
+            cls, ic = ("good", "●") if not r["caveats"] else ("warning", "▲")
+        else:
+            cls, ic = "critical", "✕"
+        label = "SURVIVES" if r["verdict"].startswith("SURVIVES") else "FAILS"
+        return f'<span class="badge {cls}"><span class="ic">{ic}</span>{label}</span>'
+    trs = "".join(
+        f'<tr><td class="name">{_esc(r["name"])}</td>'
+        f'<td class="num">{_fmt(r["close_sharpe"])}</td>'
+        f'<td class="num">{_fmt(r["delayed_sharpe"])}</td>'
+        f'<td class="num">{_fmt(100 * r["exposure"], 0, "%")}</td>'
+        f'<td class="num">{r["p_value"]}</td>'
+        f'<td class="num">{r["p_adjusted"]}</td>'
+        f'<td class="num">{"—" if r.get("p_oos") is None else r["p_oos"]}</td>'
+        f'<td>{badge(r)}</td>'
+        f'<td class="muted-cell">{_esc("; ".join(r["fails"] or r["caveats"]))}</td>'
+        f'</tr>' for r in v["rows"])
+    n_ok = sum(1 for r in v["rows"] if r["verdict"].startswith("SURVIVES"))
+    return f"""
+<section class="card">
+  <h2>Does any of it survive being tested properly?</h2>
+  <p class="lede">Three tests, all of which most strategies fail.
+  <b>Sh(+1 open)</b> re-fills every trade at the next bar's open instead of the
+  close that produced the signal — a rule that needs the close it just saw is not
+  tradeable. <b>p</b> compares the strategy against its own position pattern slid
+  to random points in history: same trade count, same holding periods, same
+  exposure, wrong dates. <b>p_adj</b> corrects that for the
+  {v["hypotheses"]} hypotheses this run explored, after collapsing near-duplicates
+  ({v["shortlist"] - v["independent"]} of {v["shortlist"]} shortlisted candidates
+  were copies of a stronger one). <b>p_oos</b> repeats the permutation test on the
+  held-out tail alone.</p>
+  <div class="scroll"><table class="lb">
+    <thead><tr><th>candidate</th><th class="num">Sharpe</th>
+      <th class="num">Sh(+1 open)</th><th class="num">exposure</th>
+      <th class="num">p</th><th class="num">p_adj</th><th class="num">p_oos</th>
+      <th>verdict</th><th>why</th></tr></thead>
+    <tbody>{trs}</tbody></table></div>
+  <p class="note">{n_ok} of {v["shortlist"]} survived. The permutation test cannot
+  report a p below {v.get("p_floor")} with the sample count used, and Bonferroni
+  over {v["hypotheses"]} hypotheses would demand p ≤ {v["bonferroni"]}. None of
+  this proves an edge — it only fails to kill one. What it cannot see: regime
+  change, capacity, borrow, and the fact that you are not the only person who has
+  run this test.</p>
+</section>"""
+
+
 def _prop_section(rep):
     sw = rep.get("prop")
     if not sw or not sw.get("cols"):
@@ -603,6 +729,7 @@ body.nums .cell .v{opacity:1}
  letter-spacing:.5px}
 .lb .num,.lb th.num{text-align:right;font-variant-numeric:tabular-nums}
 .lb .name{font-weight:600}
+.lb .muted-cell{color:var(--muted);font-size:11px;white-space:normal;max-width:34ch}
 .scorecell{display:flex;align-items:center;gap:8px}
 .scorebar{display:inline-block;width:90px;height:8px;border-radius:4px;
  background:var(--line);overflow:hidden}
@@ -693,6 +820,8 @@ def render(report) -> str:
                       "trade at the same time, −1 = systematically opposite sides, 0 = "
                       "independent exposure. Correlation says results agree; this says "
                       "the positions themselves do."),
+        _hybrid_section(report),
+        _validation_section(report),
         _prop_section(report),
         _decomp_section(report),
         _sweep_section(report),

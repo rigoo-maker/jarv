@@ -277,3 +277,167 @@ def registry(cache):
     if cache.get("vix"):
         return dict(ALL)
     return {k: v for k, v in ALL.items() if k not in NEEDS_VIX}
+
+
+# ------------------------------------------------------------ parameter grids
+# Every rule's own knobs, so the sweep covers the whole library instead of the
+# two rules that happened to be interesting first. Each `make` returns a POSITION
+# SERIES (not a signal function) so state-machine rules can be swept honestly:
+# re-running a state machine at new thresholds is not the same as re-reading a
+# threshold, and pretending otherwise sweeps a strategy nobody trades.
+
+
+def _series(fn, n):
+    return [fn(i) for i in range(n)]
+
+
+def _sma_of(cache, length, _cache={}):
+    key = (id(cache), length)
+    if key not in _cache:
+        _cache[key] = _sma(cache["close"], length)
+    return _cache[key]
+
+
+def _mk_sma_trend(cache, L, _y=None):
+    close, ma = cache["close"], _sma_of(cache, L)
+    return [1 if (ma[i] is not None and close[i] > ma[i]) else 0
+            for i in range(len(close))]
+
+
+def _mk_cross(cache, fast, slow):
+    a, b = _sma_of(cache, fast), _sma_of(cache, slow)
+    return [1 if (a[i] is not None and b[i] is not None and a[i] > b[i]) else 0
+            for i in range(len(a))]
+
+
+def _mk_connors(cache, entry, trend_len):
+    close, rsi2, sma5 = cache["close"], cache["rsi2"], cache["sma5"]
+    trend = _sma_of(cache, trend_len)
+    pos, out = 0, []
+    for i in range(len(close)):
+        if None in (trend[i], sma5[i], rsi2[i]):
+            out.append(0)
+            continue
+        if pos == 0:
+            if close[i] > trend[i] and rsi2[i] < entry:
+                pos = 1
+        elif close[i] > sma5[i] or close[i] < trend[i]:
+            pos = 0
+        out.append(pos)
+    return out
+
+
+def _mk_ibs(cache, level, trend_len):
+    close, ibs = cache["close"], cache["ibs"]
+    trend = _sma_of(cache, trend_len)
+    return [1 if (ibs[i] is not None and trend[i] is not None
+                  and ibs[i] < level and close[i] > trend[i]) else 0
+            for i in range(len(close))]
+
+
+def _mk_gap(cache, gap_pct, trend_len):
+    close, gap = cache["close"], cache["gap"]
+    trend = _sma_of(cache, trend_len)
+    return [1 if (gap[i] is not None and trend[i] is not None
+                  and gap[i] < -gap_pct / 100.0 and close[i] > trend[i]) else 0
+            for i in range(len(close))]
+
+
+def _mk_tom(cache, before, after):
+    idx, ln = cache["tom_idx"], cache["month_len"]
+    return [1 if (ln[i] and (idx[i] >= ln[i] - before or idx[i] < after)) else 0
+            for i in range(len(idx))]
+
+
+def _mk_mom(cache, lookback, skip):
+    close = cache["close"]
+    out = [0] * len(close)
+    for i in range(lookback + skip, len(close)):
+        past = close[i - lookback - skip]
+        if past and close[i - skip] / past - 1 > 0:
+            out[i] = 1
+    return out
+
+
+def _mk_breakout(cache, lookback, exit_len):
+    close, high = cache["close"], cache["high"]
+    exit_ma = _sma_of(cache, exit_len)
+    pos, out = 0, []
+    for i in range(len(close)):
+        if i < lookback or exit_ma[i] is None:
+            out.append(0)
+            continue
+        if pos == 0:
+            if close[i] >= max(high[i - lookback:i]):
+                pos = 1
+        elif close[i] < exit_ma[i]:
+            pos = 0
+        out.append(pos)
+    return out
+
+
+def _mk_vix_calm(cache, ma_len, _y=None):
+    v = cache["vix"]
+    if not v:
+        return [0] * len(cache["close"])
+    ma = _sma(v, ma_len)
+    return [1 if (v[i] is not None and ma[i] is not None and v[i] < ma[i]) else 0
+            for i in range(len(v))]
+
+
+def _mk_vix_spike(cache, z_thresh, hold):
+    z, close, sma200 = cache["vix_z"], cache["close"], cache["sma200"]
+    if not z:
+        return [0] * len(close)
+    pos, left, out = 0, 0, []
+    for i in range(len(close)):
+        if z[i] is None or sma200[i] is None:
+            out.append(0)
+            continue
+        if pos == 0 and z[i] >= z_thresh:
+            pos, left = 1, hold
+        elif pos == 1:
+            left -= 1
+            if left <= 0:
+                pos = 0
+        out.append(pos)
+    return out
+
+
+SWEEP_SPECS = {
+    "sma200_trend": {"x": ("trend SMA", [20, 50, 100, 150, 200, 250, 300]),
+                     "y": None, "make": _mk_sma_trend},
+    "golden_cross": {"x": ("slow SMA", [100, 150, 200, 250, 300]),
+                     "y": ("fast SMA", [10, 20, 50, 75, 100]),
+                     "make": lambda c, x, y: _mk_cross(c, y, x)},
+    "connors_rsi2": {"x": ("trend SMA", [50, 100, 150, 200, 250, 300]),
+                     "y": ("RSI2 entry", [5, 10, 15, 20, 25, 30]),
+                     "make": lambda c, x, y: _mk_connors(c, y, x)},
+    "ibs_reversion": {"x": ("trend SMA", [50, 100, 200, 300]),
+                      "y": ("IBS below", [0.05, 0.1, 0.15, 0.2, 0.3, 0.4]),
+                      "make": lambda c, x, y: _mk_ibs(c, y, x)},
+    "gap_fade": {"x": ("trend SMA", [50, 100, 200, 300]),
+                 "y": ("down-gap %", [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]),
+                 "make": lambda c, x, y: _mk_gap(c, y, x)},
+    "turn_of_month": {"x": ("days into month", [1, 2, 3, 4, 5]),
+                      "y": ("days before end", [1, 2, 3, 4, 5]),
+                      "make": lambda c, x, y: _mk_tom(c, y, x)},
+    "momentum_12_1": {"x": ("lookback bars", [63, 126, 189, 252, 378, 504]),
+                      "y": ("skip bars", [0, 5, 10, 21, 42]),
+                      "make": lambda c, x, y: _mk_mom(c, x, y)},
+    "high52_breakout": {"x": ("high lookback", [63, 126, 189, 252, 378]),
+                        "y": ("exit SMA", [50, 100, 150, 200, 250]),
+                        "make": lambda c, x, y: _mk_breakout(c, x, y)},
+    "vix_calm": {"x": ("VIX SMA", [10, 20, 50, 100, 200]), "y": None,
+                 "make": _mk_vix_calm},
+    "vix_spike_reversal": {"x": ("VIX z-score", [1.0, 1.5, 2.0, 2.5, 3.0]),
+                           "y": ("hold bars", [1, 3, 5, 10, 21]),
+                           "make": _mk_vix_spike},
+}
+
+
+def sweep_specs(cache):
+    """Grids for the rules this dataset can actually support."""
+    if cache.get("vix"):
+        return dict(SWEEP_SPECS)
+    return {k: v for k, v in SWEEP_SPECS.items() if k not in NEEDS_VIX}

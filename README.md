@@ -215,6 +215,73 @@ Read it with the sample in mind: one stock, in a 15-year uptrend, with no 2008 i
 the window — precisely the conditions where a 200-day filter cannot win. The same
 maps on a bear-inclusive range are the interesting follow-up.
 
+## Finding strategies: search → sweep → hybrid → proof
+
+`discover` runs the whole pipeline in one pass, ordered so no stage can cheat the
+next:
+
+```bash
+python3 -m krypt.app discover --source csv --file nasdq.csv --symbols NDAQ \
+        --strats equity --fee-bps 1 --slippage-bps 2
+```
+
+1. **Sweep** every rule's parameter grid (226 cells across 10 rules for the equity
+   library) and pick each rule's best cell **in-sample only**. Choosing a
+   parameter by its out-of-sample result and then reporting that result as
+   out-of-sample is the oldest way to fool yourself in this business.
+2. **Hybridise** the tuned rules five ways — `AND` (both long), `OR` (either),
+   `k-of-n` vote, `SWITCH` (one rule above the 200-day line, another below), and
+   equal-weight `portfolio` (splits capital, rebalances daily, combines equity
+   curves rather than signals).
+3. **Prove or discard**, with three tests most strategies fail:
+   - **next-open fills** — refill every trade at the next bar's open instead of
+     the close that produced the signal. A rule that needs the close it just saw
+     is not tradeable.
+   - **timing permutation** — slide the exact position series (same trades, same
+     holding periods, same exposure) to random points in history a few thousand
+     times. If the real Sharpe sits inside that distribution, the timing carried
+     no information.
+   - **multiple testing** — Benjamini-Hochberg across every hypothesis the run
+     explored, after collapsing near-duplicates, because eleven combinations
+     containing the same rule are eleven copies of one test and feeding copies to
+     BH manufactures significance.
+
+### What it found on NDAQ (14 years, 3,914 daily bars)
+
+| candidate | Sharpe | next-open | exposure | p | p adj. | p (held-out) |
+|---|---|---|---|---|---|---|
+| connors_rsi2* SWITCH turn_of_month* | 1.14 | 0.90 | 14% | 0.0006 | 0.063 | 0.013 |
+| connors_rsi2* (RSI2<5, SMA250) | 1.12 | 0.94 | 6% | 0.0006 | 0.063 | 0.007 |
+| **buy & hold** | **0.73** | 0.74 | 100% | — | — | — |
+| connors_rsi2 (untuned) | 0.37 | 0.38 | 11% | 0.24 | 1.0 | 0.08 |
+| sma200_trend | 0.56 | 0.57 | 77% | 0.72 | 1.0 | 0.16 |
+
+Findings, in order of how much they should change what you do:
+
+- **Every trend rule fails the permutation test.** `sma200_trend` scores p = 0.72
+  — its own position pattern applied at *random dates* does better more than
+  two-thirds of the time. Its return comes from being in the market 77% of the
+  time, not from choosing when. Same story for `golden_cross` and
+  `momentum_12_1`. They are beta.
+- **One signal type stands out: RSI(2) mean reversion inside a long trend
+  filter.** It is the only family with p below 0.001, and the only one whose
+  timing is still significant on the held-out tail alone (p = 0.007). At 6%
+  exposure it earns Sharpe 1.12 against buy & hold's 0.73 — better paid per unit
+  of risk, far worse in absolute return (139% vs 700%).
+- **The hybrids mostly change exposure, not edge.** Eleven combinations "survived"
+  before de-duplication and every one contained the same RSI(2) rule: one finding
+  wearing eleven names. Only `SWITCH turn_of_month` adds anything, and it adds
+  exposure rather than signal.
+- **Nothing clears a correction for 400 hypotheses.** The best candidate lands at
+  p_adj 0.063 against a 0.05 bar. That is a *candidate*, not an edge — and the way
+  it becomes one is a different symbol or date range, where it is a single
+  hypothesis instead of one of hundreds and the same p-value would be conclusive.
+- **The untuned rule does not survive** — only the parameter-tuned variant does,
+  which is exactly what the correction exists to catch.
+
+So: **focus on short-horizon mean reversion, not trend following**, and prove it
+somewhere else before sizing it.
+
 ## Prop-firm rules (Apex, Topstep)
 
 A funded-account evaluation is not a small trading account — it is a different
@@ -358,6 +425,10 @@ and even then conservatively.
   steps, so a loss is exactly as loud as an equal gain, in light and dark.
 - **`ninjascript.py`** — NinjaTrader 8 exporter: all 10 strategies as C#, with
   the measured evidence and a data-derived regime filter in each header.
+- **`hybrids.py`** — AND / OR / k-of-n vote / regime-switch / equal-weight
+  portfolio combinations, all judged on the same terms as a single rule.
+- **`validate.py`** — the proof layer: next-open fills, timing-permutation
+  p-values, Benjamini-Hochberg over everything explored, near-duplicate collapse.
 - **`propfirm.py`** — Apex/Topstep rulebooks as an engine: trailing drawdown
   (unrealized vs end-of-day), daily loss limits, consistency, contract caps,
   evaluation across many start dates, and a live `PropGuard`.

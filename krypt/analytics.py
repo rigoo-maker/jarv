@@ -532,9 +532,46 @@ class Analysis:
                 "title": "IBS reversion robustness - close-in-range threshold",
                 "col_title": "IBS threshold"}
 
+    def sweep_grid(self, name, spec, in_sample_only=False):
+        """One rule's whole parameter grid, backtested cell by cell."""
+        xlab, xs = spec["x"]
+        ylab, ys = spec["y"] if spec["y"] else (None, [None])
+        split = self._split()
+        rows = []
+        for y in ys:
+            cells = []
+            for x in xs:
+                pos = spec["make"](self.cache, x, y)
+                fn = lambda c, i, _p=pos: _p[i]
+                if in_sample_only:
+                    cells.append({**self._run(self.warmup, split, fn),
+                                  "params": {"x": x, "y": y}})
+                else:
+                    cells.append({**self._stats_of(fn), "params": {"x": x, "y": y}})
+            rows.append({"strategy": (f"{ylab} {y}" if ylab else name),
+                         "cells": cells})
+        return {"cols": [{"label": str(x), "value": x} for x in xs],
+                "rows": rows, "metric": "total_return_pct", "unit": "%", "fmt": 1,
+                "title": f"{name} — {xlab}" + (f" x {ylab}" if ylab else ""),
+                "col_title": (f"{ylab} \\ {xlab}" if ylab else xlab),
+                "strategy": name}
+
+    def _split(self):
+        return int(self.warmup + (self.n - self.warmup) * (1 - self.oos_frac))
+
+    def sweep_all(self, specs, in_sample_only=True):
+        """Every rule's grid. Selection uses IN-SAMPLE cells only — choosing a
+        parameter by its out-of-sample result and then reporting that result as
+        out-of-sample is the oldest way to fool yourself in this business."""
+        return [self.sweep_grid(n, sp, in_sample_only=in_sample_only)
+                for n, sp in specs.items()]
+
     def sweeps(self):
         """Whichever parameter grids the loaded strategy family actually has."""
         out = []
+        if "rsi2" in self.cache:
+            from . import strats_equity as eqlib
+            return self.sweep_all(eqlib.sweep_specs(self.cache), in_sample_only=False)
         if "rsi" in self.cache:
             out.append({**self.sweep_rsi(),
                         "title": "RSI reversion robustness - oversold x overbought",
@@ -542,9 +579,6 @@ class Analysis:
             out.append({**self.sweep_vwap(),
                         "title": "VWAP reversion robustness - band width",
                         "unit": "%", "fmt": 1, "col_title": "band"})
-        if "rsi2" in self.cache:
-            out.append(self.sweep_connors())
-            out.append(self.sweep_ibs())
         return out
 
     def decomposition(self, wm):
