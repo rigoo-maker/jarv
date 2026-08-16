@@ -103,6 +103,61 @@ def main():
         rows1[0]["strategy"], rows1[0]["total_return_pct"], liq10))
     assert liq10 >= 0  # leverage model wired
 
+    # edge analytics: every map + the active-edge ranking
+    from . import analytics as ana
+    rep = ana.Analysis("BTCUSDT", "1m", candles, windows=4).run_all()
+    assert len(rep["windows"]["cols"]) == 4
+    assert len(rep["windows"]["rows"]) == len(strats.REGISTRY)
+    assert len(rep["regimes"]["cols"]) == 9          # 3 trend x 3 volatility
+    assert len(rep["hours"]["cols"]) == 24
+    assert len(rep["costs"]["cols"]) == 7
+    corr = rep["correlation"]["matrix"]
+    assert all(abs(corr[i][i] - 1.0) < 1e-9 for i in range(len(corr)))
+    for i in range(len(corr)):                        # correlation is symmetric
+        for j in range(len(corr)):
+            a, b = corr[i][j], corr[j][i]
+            assert (a is None and b is None) or abs(a - b) < 1e-9
+    ov = rep["overlap"]["matrix"]
+    assert all(v is None or -1.0001 <= v <= 1.0001 for row in ov for v in row)
+    edge = rep["edge"]["rows"]
+    assert len(edge) == len(strats.REGISTRY)
+    assert all(0 <= r["score"] <= 100 for r in edge)
+    assert edge == sorted(edge, key=lambda r: r["score"], reverse=True)
+    print("analytics : %d windows, %d regimes, %d cost levels; best=%s (%s, score %s)" % (
+        len(rep["windows"]["cols"]), len(rep["regimes"]["cols"]),
+        len(rep["costs"]["cols"]), edge[0]["strategy"], edge[0]["verdict"],
+        edge[0]["score"]))
+
+    # heatmap report renders, is self-contained, and paints both themes
+    from . import heatmap as hm
+    page = hm.render(rep)
+    assert "KRYPT edge maps" in page and "<td class=\"cell\"" in page
+    assert "http://" not in page and "https://" not in page   # no CDN, works offline
+    assert "prefers-color-scheme" in page and "data-theme" in page
+    worst = min(min(hm.contrast(l, il), hm.contrast(d, idk))
+                for v in (i / 20 for i in range(-20, 21))
+                for l, d, il, idk in [hm.cell_colors(v, 1.0)])
+    assert worst > 4.0, worst        # cell numbers stay readable on every step
+    with open("krypt_heatmaps.html", "w") as f:
+        f.write(page)
+    print("heatmaps  : wrote krypt_heatmaps.html (%d bytes), worst cell-ink "
+          "contrast %.2f:1" % (len(page), worst))
+
+    # NinjaScript generation for every strategy
+    from . import ninjascript as nj
+    for name in strats.REGISTRY:
+        fname, code = nj.generate(name, rep)
+        assert code.count("{") == code.count("}"), name
+        assert code.isascii(), name           # NinjaScript editors are not UTF-8 safe
+        for needle in ("namespace NinjaTrader.NinjaScript.Strategies",
+                       "protected override void OnStateChange()",
+                       "protected override void OnBarUpdate()",
+                       "State.SetDefaults", "EnterLong(", "EnterShort(",
+                       "SetStopLoss(", "WHAT THE ANALYSIS MEASURED"):
+            assert needle in code, (name, needle)
+    print("ninjascript: generated %d NinjaTrader 8 strategies (balanced braces, "
+          "ASCII, evidence headers)" % len(strats.REGISTRY))
+
     print("\nALL SMOKE CHECKS PASSED ✓")
 
 

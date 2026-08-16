@@ -4,6 +4,9 @@ Subcommands:
   analyze   one-shot read-only snapshot -> writes krypt_dashboard.html
   serve     live dashboard at http://localhost:PORT (auto-refresh) + trading loop
   backtest  run the trend strategy over historical candles, report stats
+  compare   rank all 10 strategies over one sample
+  heatmap   edge-decay / regime / cost / correlation maps -> krypt_heatmaps.html
+  ninja     export the surviving strategies as NinjaTrader 8 NinjaScript (.cs)
 
 Mode (analyze|paper|live) and all risk limits come from env / config.py.
 LIVE requires the two-lock guard (see config.assert_live_allowed).
@@ -23,10 +26,13 @@ from .binance_client import BinanceClient, BinanceError
 from .risk import RiskEngine
 from .trader import Trader
 from .alerts import default_rules
-from .strategies import make_strategy
+from .strategies import make_strategy, REGISTRY as LIVE_STRATEGIES
 from .engine import Engine
 from . import dashboard, live_dashboard, indicators, data as datamod, backtest as bt
 from . import strats as stratlib
+from . import analytics as ana
+from . import heatmap as heatmapmod
+from . import ninjascript as nj
 from .scoring import score_snapshot
 from datetime import date, timedelta
 
@@ -185,6 +191,73 @@ def cmd_compare(cfg, days, limit, leverage, fee_bps, slippage_bps, no_compound):
               "this is what 'high leverage' does to a thin edge.")
 
 
+def _analyze_edge(cfg, days, limit, args):
+    """Shared by `heatmap` and `ninja`: load candles, run every map."""
+    sym = cfg.symbols[0]
+    candles = _load_candles(cfg, days, limit)
+    if len(candles) < 300:
+        print("need at least ~300 candles for the maps (try --days 21).",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Analyzing {len(candles)} candles across {args.windows} windows "
+          f"x {len(stratlib.REGISTRY)} strategies ...")
+    a = ana.Analysis(sym, cfg.interval, candles, windows=args.windows,
+                     fee_bps=args.fee_bps, slippage_bps=args.slippage_bps,
+                     allow_short=not args.long_only, leverage=args.leverage,
+                     oos_frac=args.oos_frac)
+    return a.run_all()
+
+
+def cmd_heatmap(cfg, days, limit, args):
+    """Build every edge map and write the HTML report."""
+    report = _analyze_edge(cfg, days, limit, args)
+    ana.print_edge_table(report)
+    out = args.out or "krypt_heatmaps.html"
+    with open(out, "w") as f:
+        f.write(heatmapmod.render(report))
+    print(f"\n>> wrote {out} — heatmaps for edge-over-time, regime, cost "
+          f"sensitivity,\n   session, correlation, position overlap and "
+          f"parameter robustness.")
+    keep = nj.recommend(report, top=3)
+    if keep:
+        print(f">> candidates worth a second date range: {', '.join(keep)}")
+        print("   export them to NinjaTrader with: python3 -m krypt.app ninja "
+              f"--days {days or 21}")
+    else:
+        print(">> nothing on this sample clears the bar. That IS the result — "
+              "no strategy\n   here is worth risking money on this data.")
+
+
+def cmd_ninja(cfg, days, limit, args):
+    """Generate NinjaScript (.cs) for the strategies that still show an edge."""
+    report = None
+    if args.no_analysis:
+        names = [args.strategy] if args.strategy else list(stratlib.REGISTRY)
+        print("Skipping analysis (--no-analysis): headers will carry no evidence.")
+    else:
+        report = _analyze_edge(cfg, days, limit, args)
+        ana.print_edge_table(report)
+        names = [args.strategy] if args.strategy else nj.recommend(report, top=args.top)
+        if not names:
+            print("\nNo strategy cleared the bar on this sample, so nothing was "
+                  "exported.\n(Use --strategy NAME to export one anyway, with its "
+                  "real numbers in the header.)")
+            return
+    unknown = [n for n in names if n not in stratlib.REGISTRY]
+    if unknown:
+        print(f"unknown strategy: {', '.join(unknown)}", file=sys.stderr)
+        sys.exit(1)
+    paths = nj.export(names, report, outdir=args.outdir, quantity=args.quantity,
+                      allow_short=not args.long_only)
+    print(f"\n>> wrote {len(paths)} file(s) to ./{args.outdir}/")
+    for p in paths:
+        print("   ", p)
+    print("   Copy the .cs files to Documents\\NinjaTrader 8\\bin\\Custom\\Strategies\\, "
+          "press F5 in the\n   NinjaScript editor, then backtest them in Strategy "
+          "Analyzer on YOUR instrument\n   and YOUR costs before going anywhere near "
+          "a live account.")
+
+
 def cmd_live(cfg, exchange):
     """Write a standalone live-tick dashboard (browser connects to exchange WS)."""
     sym = cfg.symbols[0]
@@ -198,11 +271,14 @@ def cmd_live(cfg, exchange):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
     p.add_argument("command",
-                   choices=["analyze", "serve", "backtest", "compare", "live", "download"])
+                   choices=["analyze", "serve", "backtest", "compare", "heatmap",
+                            "ninja", "live", "download"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
-    p.add_argument("--strategy", choices=["scalper", "market_maker", "hedge", "trend"])
+    p.add_argument("--strategy",
+                   help="serve/analyze: scalper|market_maker|hedge|trend; "
+                        "ninja: one of the 10 backtest strategies")
     p.add_argument("--venue", choices=["binance", "coinbase"], help="execution venue")
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--limit", type=int, default=500)
@@ -213,10 +289,38 @@ def main(argv=None):
     p.add_argument("--slippage-bps", type=float, default=2.0)
     p.add_argument("--no-compound", action="store_true", help="disable equity compounding")
     p.add_argument("--leverage", type=float, default=1.0, help="leverage for compare/backtest")
+    p.add_argument("--windows", type=int, default=12,
+                   help="time slices for the edge-decay heatmap")
+    p.add_argument("--oos-frac", type=float, default=0.3,
+                   help="fraction of the sample held out of sample (heatmap/ninja)")
+    p.add_argument("--long-only", action="store_true",
+                   help="no shorts (spot accounts)")
+    p.add_argument("--out", help="output file for the heatmap report")
+    p.add_argument("--outdir", default="ninja", help="output dir for NinjaScript")
+    p.add_argument("--top", type=int, default=3,
+                   help="how many ranked strategies to export to NinjaScript")
+    p.add_argument("--quantity", type=int, default=1,
+                   help="default order quantity in generated NinjaScript")
+    p.add_argument("--no-analysis", action="store_true",
+                   help="emit NinjaScript templates without measuring anything")
     args = p.parse_args(argv)
 
+    # --strategy is overloaded: live strategies for analyze/serve, backtest
+    # strategies for ninja. Validate against the right registry instead of
+    # letting it blow up several layers down.
+    if args.strategy:
+        live_cmds = ("analyze", "serve")
+        valid = (list(LIVE_STRATEGIES) if args.command in live_cmds
+                 else list(stratlib.REGISTRY))
+        if args.strategy not in valid:
+            print(f"SAFETY: unknown --strategy '{args.strategy}' for command "
+                  f"'{args.command}'. choices: {', '.join(valid)}", file=sys.stderr)
+            sys.exit(2)
+
     cfg = load_config(mode=args.mode, symbols=args.symbols,
-                      interval=args.interval, strategy=args.strategy, venue=args.venue)
+                      interval=args.interval,
+                      strategy=args.strategy if args.command in ("analyze", "serve") else None,
+                      venue=args.venue)
     try:
         cfg.assert_live_allowed()
     except PermissionError as e:
@@ -234,6 +338,10 @@ def main(argv=None):
         elif args.command == "compare":
             cmd_compare(cfg, args.days, args.limit, args.leverage,
                         args.fee_bps, args.slippage_bps, args.no_compound)
+        elif args.command == "heatmap":
+            cmd_heatmap(cfg, args.days, args.limit, args)
+        elif args.command == "ninja":
+            cmd_ninja(cfg, args.days, args.limit, args)
         elif args.command == "download":
             cmd_download(cfg, args.days or 21, args.kind)
         elif args.command == "live":

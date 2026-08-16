@@ -73,6 +73,12 @@ python3 -m krypt.app serve --strategy scalper --mode paper
 # Backtest the scoring engine on historical candles
 python3 -m krypt.app backtest --symbols BTCUSDT --interval 1h --limit 500
 
+# Which strategies still have an edge? -> krypt_heatmaps.html
+python3 -m krypt.app heatmap --days 30 --interval 1m
+
+# Export the survivors as NinjaTrader 8 strategies -> ./ninja/*.cs
+python3 -m krypt.app ninja --days 30 --top 3
+
 # Offline self-test (no network)
 python3 -m krypt._smoke
 ```
@@ -101,6 +107,84 @@ python3 -m krypt.app serve    --mode paper --strategy <winner>  # live-paper the
 compounding) and prints a leaderboard ranked by Sharpe. **The top row is a
 hypothesis, not an edge** — it's in-sample. Re-run on a *different* date range
 (out-of-sample) before believing it. That discipline is the actual edge.
+
+## Which edge is *still* active: the heatmaps
+
+`compare` answers "what won over the whole sample?", which is the wrong question:
+a strategy can post a great total and be **dead for the last week**. `heatmap`
+slices the sample instead of averaging it away.
+
+```bash
+python3 -m krypt.app heatmap --days 30 --interval 1m --windows 12
+# -> ranked ACTIVE EDGE table in the terminal + krypt_heatmaps.html
+```
+
+Seven maps, each answering one question (open the HTML — hover any cell for its
+full stats, "Show numbers" prints them in the grid, and it works offline):
+
+| Map | Question it answers |
+|-----|---------------------|
+| **Edge over time** (strategy × time slice) | Is the edge alive, or is it a memory? Blue left / red right = decayed. |
+| **Regime map** (strategy × trend strength × volatility) | *Where* the money came from. Mean reversion should pay in **chop** and bleed in **strong** trends; breakout the reverse. Equal everywhere = probably just long the drift. |
+| **Cost sensitivity** (strategy × fee+slippage) | Edge, or fee subsidy? A row that's blue at 0 bps and red by 10 never had an edge. |
+| **Session map** (strategy × hour UTC) | Time-of-day effects — treat with suspicion, 24 columns is a lot of chances to find noise. |
+| **Correlation of net returns** | Two strategies above ~0.8 are one trade with two names: stacking them doubles risk, not edge. |
+| **Position overlap** | Cosine similarity of the raw positions — correlation says results agree, this says the positions do. |
+| **Parameter sweeps** (RSI thresholds, VWAP band) | A real edge is a **plateau**; one hot cell in a cold field is a curve fit. |
+
+### The ACTIVE EDGE score
+
+Every map folds into one ranking that deliberately penalizes strategies whose
+edge is in the past:
+
+```
+score = 0.30 recency-weighted window Sharpe   (half-life ¼ of the sample)
+      + 0.25 OUT-OF-SAMPLE Sharpe             (last 30% of bars, held out)
+      + 0.20 hit rate across windows
+      + 0.15 improving-vs-decaying
+      + 0.10 full-sample Sharpe
+      × reliability (too few trades to trust) × consistency (0.6 + 0.4 × hit rate)
+      capped at 45 if the held-out slice lost money
+```
+
+Verdicts are `ACTIVE EDGE` / `WEAK / WATCH` / `FADING` / `NO EDGE` / `THIN SAMPLE`.
+All Sharpes are **annualized and net of costs** (note: `backtest`'s own Sharpe uses
+a different, per-sample convention — the two are not comparable).
+
+**It is a ranking heuristic, not proof.** Ten strategies across a dozen windows,
+nine regimes and dozens of parameter cells is hundreds of comparisons — some cells
+are blue by luck. The out-of-sample column and the plateau test fight that; they
+don't win it. Re-run on another date range and another symbol before believing a row.
+
+## Exporting to NinjaTrader (NinjaScript)
+
+The strategies that survive the maps can be emitted as NinjaTrader 8 C# strategies:
+
+```bash
+python3 -m krypt.app ninja --days 30 --top 3          # export the ranked survivors
+python3 -m krypt.app ninja --days 30 --strategy rsi_reversion   # export one by name
+python3 -m krypt.app ninja --no-analysis              # bare templates, no measurements
+```
+
+Writes `ninja/Krypt*.cs` plus an install README. Every one of the 10 strategies has
+a template (`ema_cross`, `macd_cross`, `rsi_reversion`, `bb_breakout`, `bb_reversion`,
+`donchian_breakout`, `vwap_reversion`, `stochrsi_cross`, `adx_di`, `confluence` —
+the last is a full port of the weighted scoring engine). Each generated file:
+
+- **mirrors `strats.py` rule-for-rule** on bar close, converting where NinjaTrader
+  differs (its StochRSI is 0..1, KRYPT's is 0..100; Donchian uses the *prior* N bars),
+- carries **the measured evidence in its header** — edge score, verdict, OOS Sharpe,
+  which regime the money came from, and the cost level where it stopped working,
+- ships a **regime filter chosen by the regime map, not by the textbook**. If the
+  data disagrees with "reversion likes chop", the file says so and ships the filter
+  **off**,
+- exposes stop/target/quantity/session/long-only as NinjaScript parameters,
+- is pure ASCII (NinjaScript editors are not reliably UTF-8).
+
+Install: copy the `.cs` files to `Documents\NinjaTrader 8\bin\Custom\Strategies\`,
+press **F5** in the NinjaScript editor, then **backtest in Strategy Analyzer on your
+instrument and your costs** — the KRYPT numbers came from crypto spot bars, a
+different market with different microstructure. Sim101 before anything live.
 
 ### About leverage (read before you set `--leverage`)
 
@@ -132,6 +216,14 @@ and even then conservatively.
   - `hedge` — **delta hedge**: offsets spot exposure with a futures short,
     sized dynamically by trend regime (ADX).
   - `trend` — slower trend-following on the scoring engine.
+- **`analytics.py`** — the edge maps: window/regime/hour/cost matrices, return
+  correlation + position overlap, parameter sweeps, and the ACTIVE EDGE score
+  with an out-of-sample split.
+- **`heatmap.py`** — self-contained HTML report (no CDN) with a computed
+  diverging color scale — both arms generated from the same OKLab lightness
+  steps, so a loss is exactly as loud as an equal gain, in light and dark.
+- **`ninjascript.py`** — NinjaTrader 8 exporter: all 10 strategies as C#, with
+  the measured evidence and a data-derived regime filter in each header.
 - **`risk.py`** — position sizing, limits, daily-loss + kill-switch halts.
 - **`trader.py`** — analyze/paper/live execution with audit logging.
 - **`binance_client.py`** — stdlib REST client (public data + signed trading,
