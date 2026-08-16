@@ -36,6 +36,7 @@ from . import heatmap as heatmapmod
 from . import ninjascript as nj
 from . import csvdata
 from . import strats_equity as eqlib
+from . import propfirm as prop
 from .scoring import score_snapshot
 from datetime import date, timedelta
 
@@ -245,10 +246,38 @@ def _analyze_edge(cfg, days, limit, args):
     return a.run_all()
 
 
+def _attach_prop(report, cfg, days, limit, args):
+    """Add the prop-firm pass-rate map to an existing report."""
+    candles = _load_candles(cfg, days, limit, args)
+    info = _load_candles.last_info
+    rules = prop.load_rules(args.firm)
+    contract = prop.CONTRACTS[args.contract.upper()]
+    _, _, pos = _positions_for(candles, args, info)
+    notional = args.notional or prop.suggest_notional(candles, contract)
+    qtys = ([int(q) for q in args.qty_sweep.split(",")] if args.qty_sweep
+            else [q for q in (1, 2, 3, 4, 6, 8) if q <= rules.max_contracts])
+    sweep = prop.sweep_size(candles, pos, rules, contract, qtys,
+                            stride=args.stride, max_bars=args.max_bars,
+                            enforce_overnight=not args.allow_overnight,
+                            notional=notional)
+    sweep["rules_detail"] = {
+        "label": rules.label, "target": rules.profit_target,
+        "drawdown": rules.max_drawdown, "trail_mode": rules.trail_mode,
+        "daily_loss_limit": rules.daily_loss_limit, "as_of": rules.as_of,
+        "notional": notional, "contract": contract.symbol,
+        "overnight_enforced": not args.allow_overnight,
+    }
+    report["prop"] = sweep
+    return sweep
+
+
 def cmd_heatmap(cfg, days, limit, args):
     """Build every edge map and write the HTML report."""
     report = _analyze_edge(cfg, days, limit, args)
     ana.print_edge_table(report)
+    if args.prop:
+        sweep = _attach_prop(report, cfg, days, limit, args)
+        prop.print_size_sweep(sweep)
     out = args.out or "krypt_heatmaps.html"
     with open(out, "w") as f:
         f.write(heatmapmod.render(report))
@@ -280,12 +309,24 @@ def cmd_ninja(cfg, days, limit, args):
                   "exported.\n(Use --strategy NAME to export one anyway, with its "
                   "real numbers in the header.)")
             return
-    unknown = [n for n in names if n not in stratlib.REGISTRY]
+    known = (list(eqlib.ALL) if args.strats == "equity" else list(stratlib.REGISTRY))
+    unknown = [n for n in names if n not in known]
     if unknown:
         print(f"unknown strategy: {', '.join(unknown)}", file=sys.stderr)
         sys.exit(1)
-    paths = nj.export(names, report, outdir=args.outdir, quantity=args.quantity,
-                      allow_short=not args.long_only)
+    rules = prop.load_rules(args.firm) if args.prop else None
+    skipped = []
+    ok_names = []
+    for n in names:
+        try:
+            nj.generate(n, report, rules=rules)
+            ok_names.append(n)
+        except KeyError as e:
+            skipped.append((n, str(e).strip('"\'')))
+    paths = nj.export(ok_names, report, outdir=args.outdir, quantity=args.quantity,
+                      allow_short=not args.long_only, rules=rules)
+    for n, why in skipped:
+        print(f"  skipped {n}: {why}")
     print(f"\n>> wrote {len(paths)} file(s) to ./{args.outdir}/")
     for p in paths:
         print("   ", p)
@@ -293,6 +334,76 @@ def cmd_ninja(cfg, days, limit, args):
           "press F5 in the\n   NinjaScript editor, then backtest them in Strategy "
           "Analyzer on YOUR instrument\n   and YOUR costs before going anywhere near "
           "a live account.")
+
+
+def _positions_for(candles, args, info):
+    """(cache, registry, positions-by-strategy) for whichever library is selected."""
+    if args.strats == "equity":
+        cache = eqlib.precompute(candles, (info or {}).get("extras"))
+        registry, warmup, allow_short = eqlib.registry(cache), 300, False
+    else:
+        cache = stratlib.precompute(candles)
+        registry, warmup, allow_short = dict(stratlib.REGISTRY), 60, not args.long_only
+    pos = {name: ana.position_series(cache, fn, warmup=warmup, allow_short=allow_short)
+           for name, fn in registry.items()}
+    return cache, registry, pos
+
+
+def cmd_prop(cfg, days, limit, args):
+    """Would these strategies pass an Apex / Topstep evaluation?"""
+    candles = _load_candles(cfg, days, limit, args)
+    info = _load_candles.last_info
+    rules = prop.load_rules(args.firm)
+    contract = prop.CONTRACTS.get(args.contract.upper())
+    if contract is None:
+        print(f"unknown contract '{args.contract}'. choices: "
+              f"{', '.join(sorted(prop.CONTRACTS))}", file=sys.stderr)
+        sys.exit(1)
+    _, registry, pos = _positions_for(candles, args, info)
+    notional = args.notional or prop.suggest_notional(candles, contract)
+    if notional and not args.notional:
+        px = candles[len(candles) // 2]["close"]
+        print(f"  price series (~{px:,.2f}) is not this contract's own price — "
+              f"treating it as a PROXY at ${notional:,.0f} notional per contract.\n"
+              f"  Override with --notional. Results are an approximation of "
+              f"trading {contract.symbol}, not a simulation of it.")
+
+    rows = []
+    for name in registry:
+        cohort = prop.evaluate_cohorts(
+            candles, pos[name], rules, contract, qty=args.qty,
+            stride=args.stride, max_bars=args.max_bars,
+            enforce_overnight=not args.allow_overnight, notional=notional)
+        rows.append({"strategy": name, "cohort": cohort})
+    rows.sort(key=lambda r: r["cohort"]["pass_rate"], reverse=True)
+    prop.print_report(rows, rules, contract, args.qty, notional)
+
+    if not args.no_size_sweep:
+        qtys = [int(q) for q in args.qty_sweep.split(",")] if args.qty_sweep else \
+            [q for q in (1, 2, 3, 4, 6, 8) if q <= rules.max_contracts]
+        sweep = prop.sweep_size(candles, pos, rules, contract, qtys,
+                                stride=args.stride, max_bars=args.max_bars,
+                                enforce_overnight=not args.allow_overnight,
+                                notional=notional)
+        prop.print_size_sweep(sweep)
+        best = max(((r["strategy"], c["qty"], cell["pass_pct"])
+                    for r, cells in ((r, r["cells"]) for r in sweep["rows"])
+                    for c, cell in zip(sweep["cols"], cells)),
+                   key=lambda t: t[2], default=None)
+        if best and best[2] > 0:
+            print(f"  best combination on this sample: {best[0]} at {best[1]} "
+                  f"contract(s) — {best[2]:.0f}% of evaluations passed. "
+                  f"{100 - best[2]:.0f}% failed.")
+
+    bar_secs = ana.median_bar_secs(candles)
+    if bar_secs >= 86_400 and not args.allow_overnight:
+        print("\n  NOTE: these are DAILY bars, and every one of these strategies "
+              "holds\n  positions overnight — which Apex and Topstep both forbid "
+              "outright. The\n  failures above are that rule, not the strategies' "
+              "P&L. Prop evaluation is\n  an INTRADAY game: re-run this on "
+              "minute/hourly bars with rules that flatten\n  before the session "
+              "close, or use --allow-overnight to see the counterfactual\n  "
+              "(informative, but not a result you can trade at a prop firm).")
 
 
 def cmd_live(cfg, exchange):
@@ -309,7 +420,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="krypt", description="Advanced crypto trader")
     p.add_argument("command",
                    choices=["analyze", "serve", "backtest", "compare", "heatmap",
-                            "ninja", "live", "download"])
+                            "prop", "ninja", "live", "download"])
     p.add_argument("--mode", choices=["analyze", "paper", "live"])
     p.add_argument("--symbols")
     p.add_argument("--interval")
@@ -344,6 +455,25 @@ def main(argv=None):
     p.add_argument("--dataset", help="Kaggle dataset handle (--source kaggle)")
     p.add_argument("--strats", choices=["crypto", "equity"], default="crypto",
                    help="strategy library: crypto minutes or US equity dailies")
+    p.add_argument("--firm", default="apex-50k",
+                   help="prop rules: preset name or path to a rules JSON "
+                        f"({', '.join(sorted(prop.PRESETS))})")
+    p.add_argument("--contract", default="MNQ",
+                   help=f"futures contract ({', '.join(sorted(prop.CONTRACTS))})")
+    p.add_argument("--qty", type=int, default=1, help="contracts per trade")
+    p.add_argument("--notional", type=float,
+                   help="$ notional per contract when the price series is a proxy")
+    p.add_argument("--stride", type=int, default=21,
+                   help="bars between evaluation start dates (cohorts)")
+    p.add_argument("--max-bars", type=int,
+                   help="cap on bars per evaluation attempt")
+    p.add_argument("--qty-sweep", help="comma-separated contract sizes to sweep")
+    p.add_argument("--no-size-sweep", action="store_true",
+                   help="skip the pass-rate-by-size sweep")
+    p.add_argument("--allow-overnight", action="store_true",
+                   help="ignore the no-overnight rule (counterfactual only)")
+    p.add_argument("--prop", action="store_true",
+                   help="bake the --firm rules into the generated NinjaScript")
     p.add_argument("--no-analysis", action="store_true",
                    help="emit NinjaScript templates without measuring anything")
     args = p.parse_args(argv)
@@ -354,7 +484,8 @@ def main(argv=None):
     if args.strategy:
         live_cmds = ("analyze", "serve")
         valid = (list(LIVE_STRATEGIES) if args.command in live_cmds
-                 else list(stratlib.REGISTRY))
+                 else (list(eqlib.ALL) if args.strats == "equity"
+                       else list(stratlib.REGISTRY)))
         if args.strategy not in valid:
             print(f"SAFETY: unknown --strategy '{args.strategy}' for command "
                   f"'{args.command}'. choices: {', '.join(valid)}", file=sys.stderr)
@@ -381,6 +512,8 @@ def main(argv=None):
         elif args.command == "compare":
             cmd_compare(cfg, args.days, args.limit, args.leverage,
                         args.fee_bps, args.slippage_bps, args.no_compound)
+        elif args.command == "prop":
+            cmd_prop(cfg, args.days, args.limit, args)
         elif args.command == "heatmap":
             cmd_heatmap(cfg, args.days, args.limit, args)
         elif args.command == "ninja":

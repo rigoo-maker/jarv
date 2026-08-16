@@ -242,6 +242,56 @@ def main():
     print("equity    : %d rules (10 with VIX / 8 without), regime axis = 200-day, "
           "%.0f bars/yr" % (len(eqlib.registry(ecache)), erep["meta"]["bars_per_year"]))
 
+    # prop-firm rules: the semantics that separate Apex from Topstep
+    from . import propfirm as pf
+    apex = pf.get_rules("apex-50k")
+    tops = pf.get_rules("topstep-50k")
+
+    g = pf.PropGuard(apex, buffer_usd=0)
+    g.mark(50_000, 1_700_000_000_000)
+    g.mark(52_600, 1_700_000_060_000)          # Apex trails on UNREALISED equity
+    assert g.threshold == 50_100, g.threshold   # ...and locks at start + $100
+    g.mark(60_000, 1_700_000_120_000)
+    assert g.threshold == 50_100                # locked, does not keep trailing
+    assert not g.halted
+    assert not g.mark(50_050, 1_700_000_180_000)
+    assert g.halted and "trailing" in g.halt_reason
+
+    t = pf.PropGuard(tops, buffer_usd=0)
+    t.mark(50_000, 1_700_000_000_000)
+    t.mark(53_000, 1_700_000_060_000)           # same day: EOD trailing ignores it
+    assert t.threshold == 48_000, t.threshold
+    t.mark(53_000, 1_700_100_000_000)           # next day: trails, locks at start
+    assert t.threshold == 50_000, t.threshold
+    assert not t.mark(52_000, 1_700_100_060_000)   # -$1,000 on the day = DLL
+    assert "daily loss limit" in t.halt_reason
+    ok, why = t.check_order(3)
+    assert not ok and "PROP HALT" in why
+    ok, why = pf.PropGuard(tops).check_order(tops.max_contracts + 1)
+    assert not ok and "cap" in why
+
+    # evaluation over bars: a strategy that never trades cannot pass, and holding
+    # overnight is a hard fail at both firms
+    flat = [0] * len(daily)
+    hold = [1] * len(daily)
+    mnq = pf.CONTRACTS["MNQ"]
+    r_flat = pf.evaluate(daily, flat, apex, mnq, notional=40_000)
+    assert r_flat["result"] == "FAIL" and r_flat["reason"] == pf.FAIL_TIME
+    r_hold = pf.evaluate(daily, hold, apex, mnq, notional=40_000)
+    assert r_hold["result"] == "FAIL" and r_hold["reason"] == pf.FAIL_OVERNIGHT
+    r_ovn = pf.evaluate(daily, hold, apex, mnq, notional=40_000,
+                        enforce_overnight=False)
+    assert r_ovn["result"] in ("PASS", "FAIL")
+
+    # pass rate must be monotonically non-increasing in size for a fixed-dollar
+    # drawdown often enough to matter — check the machinery reports both ends
+    sweep = pf.sweep_size(daily, {"hold": hold}, apex, mnq, [1, 4],
+                          stride=60, enforce_overnight=False, notional=40_000)
+    assert len(sweep["rows"][0]["cells"]) == 2
+    assert all(0 <= c["pass_pct"] <= 100 for c in sweep["rows"][0]["cells"])
+    print("propfirm  : Apex trails unrealized + locks at start+100; Topstep trails "
+          "EOD + DLL;\n            overnight holds fail; size sweep runs")
+
     print("\nALL SMOKE CHECKS PASSED ✓")
 
 

@@ -163,6 +163,7 @@ def robust_scale(values, pct=0.90, floor=1e-9):
 
 COL_WINDOW = "strategy \\ window"
 COL_RSI = "oversold \\ overbought"
+COL_PROP = "strategy \\ contracts"
 
 
 def _esc(x):
@@ -175,7 +176,15 @@ def _fmt(v, digits=2, suffix=""):
     return f"{v:,.{digits}f}{suffix}"
 
 
-def _legend(scale, unit, note=""):
+def _legend(scale, unit, note="", sequential=False):
+    if sequential:
+        gl = ",".join(cell_colors(i / 20 * scale, scale)[0] for i in range(21))
+        gd = ",".join(cell_colors(i / 20 * scale, scale)[1] for i in range(21))
+        return (f'<div class="legend"><span class="lg-lab">0</span>'
+                f'<span class="ramp2" style="--gl:linear-gradient(90deg,{gl});'
+                f'--gd:linear-gradient(90deg,{gd});background-size:100% 100%"></span>'
+                f'<span class="lg-lab">{_fmt(scale)}{unit}</span>'
+                f'<span class="lg-note">{_esc(note)}</span></div>')
     grad_l = ",".join(cell_colors(((i / 20) * 2 - 1) * scale, scale)[0] for i in range(21))
     grad_d = ",".join(cell_colors(((i / 20) * 2 - 1) * scale, scale)[1] for i in range(21))
     return (f'<div class="legend"><span class="lg-lab">−{_fmt(scale)}{unit}</span>'
@@ -189,7 +198,8 @@ def _legend(scale, unit, note=""):
 
 
 def _heat_table(*, rows, cols, value_of, tip_of, label_of, row_label,
-                col_title="", unit="", scale=None, cell_fmt=1, compact=False):
+                col_title="", unit="", scale=None, cell_fmt=1, compact=False,
+                sequential=False):
     """Generic heatmap: a real <table> (so it is also the table view), with
     every cell carrying its number in the DOM for screen readers and for the
     'numbers' toggle."""
@@ -212,7 +222,7 @@ def _heat_table(*, rows, cols, value_of, tip_of, label_of, row_label,
         tds_label = _esc(row_label(r))
         body.append(f'<tr><th scope="row">{tds_label}</th>{tds}</tr>')
     cls = "heat compact" if compact else "heat"
-    return (f'{_legend(scale, unit)}'
+    return (f'{_legend(scale, unit, sequential=sequential)}'
             f'<div class="scroll"><table class="{cls}">'
             f'<thead><tr><th class="corner">{_esc(col_title)}</th>{head}</tr></thead>'
             f'<tbody>{"".join(body)}</tbody></table></div>')
@@ -396,6 +406,58 @@ def _corr_section(rep, key, title, lede):
                label_of=lambda c: _abbrev(names[c]),
                row_label=lambda r: names[r], col_title="", unit="",
                scale=1.0, cell_fmt=2, compact=True)}
+</section>"""
+
+
+def _prop_section(rep):
+    sw = rep.get("prop")
+    if not sw or not sw.get("cols"):
+        return ""
+    d = sw["rules_detail"]
+    cols = list(range(len(sw["cols"])))
+
+    def val(r, c):
+        return r["cells"][c]["pass_pct"]
+
+    def tip(r, c):
+        cell = r["cells"][c]
+        reasons = "\n".join(f"  {k}: {v}" for k, v in
+                             list(cell["failure_reasons"].items())[:4])
+        return (f'{r["strategy"]} at {sw["cols"][c]["label"]} contract(s)\n'
+                f'passed {cell["pass_pct"]}% of {cell["cohorts"]} evaluations\n'
+                f'median {cell["median_days"] or "—"} trading days to pass\n'
+                f'failures:\n{reasons}')
+    dll = (f'daily loss limit ${d["daily_loss_limit"]:,.0f}'
+           if d["daily_loss_limit"] else "no daily loss limit")
+    proxy = (f' · price series treated as a proxy at ${d["notional"]:,.0f} '
+             f'notional per contract' if d.get("notional") else "")
+    overnight = ("The no-overnight rule is ENFORCED" if d["overnight_enforced"]
+                 else "The no-overnight rule is DISABLED for this run — the numbers "
+                      "below are a counterfactual, not something a prop account "
+                      "would allow")
+    return f"""
+<section class="card">
+  <h2>Prop-firm evaluation — pass rate by position size</h2>
+  <p class="lede">Each cell re-runs the whole evaluation from many different start
+  dates and reports the share that reached the target before breaking a rule.
+  <b>{_esc(d["label"])}</b>: target ${d["target"]:,.0f}, trailing drawdown
+  ${d["drawdown"]:,.0f} ({_esc(d["trail_mode"])}), {_esc(dll)}, on
+  {_esc(d["contract"])}{_esc(proxy)}. {_esc(overnight)}.</p>
+  <p class="lede">Read across a row, not down a column. The drawdown is a fixed
+  number of dollars while your swings scale with size, so pass probability
+  collapses with contracts long before expectancy does — the best size is usually
+  the smallest one that can still reach the target in time, and it is almost never
+  the maximum the firm allows.</p>
+  {_heat_table(rows=sw["rows"], cols=cols, value_of=val, tip_of=tip,
+               label_of=lambda c: sw["cols"][c]["label"] + " ct",
+               row_label=lambda r: r["strategy"],
+               col_title=COL_PROP, unit="%", cell_fmt=0,
+               scale=100.0, sequential=True)}
+  <p class="note">Rules snapshot: {_esc(d["as_of"])}. Prop rulebooks change and
+  differ by account type — verify against the firm's current terms before
+  treating any cell here as a plan. Bar-close fills mean intrabar breaches are
+  approximated from each bar's high/low; the firms enforce tick by tick, so
+  treat these pass rates as an optimistic ceiling.</p>
 </section>"""
 
 
@@ -631,6 +693,7 @@ def render(report) -> str:
                       "trade at the same time, −1 = systematically opposite sides, 0 = "
                       "independent exposure. Correlation says results agree; this says "
                       "the positions themselves do."),
+        _prop_section(report),
         _decomp_section(report),
         _sweep_section(report),
     ])

@@ -30,6 +30,7 @@ class RiskEngine:
     halted: bool = False
     halt_reason: str = ""
     positions: dict = field(default_factory=dict)   # symbol -> Position
+    prop: object = None                 # optional propfirm.PropGuard
 
     # ---- sizing ----
 
@@ -46,9 +47,16 @@ class RiskEngine:
 
     # ---- gating ----
 
-    def check_order(self, symbol, side, notional_usd):
+    def check_order(self, symbol, side, notional_usd, contracts=None):
         if self.halted:
             return False, f"HALTED: {self.halt_reason}"
+        # Prop-firm rules are stricter than these limits and end the ACCOUNT, not
+        # just the trade, so they are checked first and their halt is sticky.
+        if self.prop is not None:
+            ok, why = self.prop.check_order(contracts if contracts is not None else 1)
+            if not ok:
+                self.halt(why)
+                return False, why
         if notional_usd > self.limits.max_order_usd + 1e-9:
             return False, (f"order ${notional_usd:.2f} exceeds max_order_usd "
                            f"${self.limits.max_order_usd:.2f}")
@@ -69,6 +77,17 @@ class RiskEngine:
             self.halt(f"daily loss ${-self.realized_pnl_today:.2f} hit limit")
             return False, self.halt_reason
         return True, "ok"
+
+    def mark_equity(self, equity_usd, now_ms=None):
+        """Push a live equity mark through the prop guard (call every tick/bar).
+
+        The trailing threshold moves with UNREALIZED profit at Apex, so a guard
+        that only sees closed trades is blind exactly when it matters.
+        """
+        self.equity_usd = equity_usd
+        if self.prop is not None and not self.prop.mark(equity_usd, now_ms):
+            self.halt(self.prop.halt_reason)
+        return not self.halted
 
     def halt(self, reason):
         self.halted = True
@@ -111,4 +130,5 @@ class RiskEngine:
             "halt_reason": self.halt_reason,
             "open_positions": {s: {"qty": p.qty, "avg": p.avg_price}
                                for s, p in self.positions.items() if abs(p.qty) > 0},
+            "prop": self.prop.snapshot() if self.prop is not None else None,
         }

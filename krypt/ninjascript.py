@@ -53,6 +53,25 @@ def P(name, ctype, default, lo, hi, display, order, group="1. Strategy"):
             "display": display, "order": order, "group": group}
 
 
+PROP_PARAMS = [
+    P("UsePropGuard", "bool", True, 0, 1, "Enforce prop-firm rules", 60,
+      "5. Prop firm"),
+    P("PropStartBalance", "double", 50000, 0, 10_000_000, "Account starting balance",
+      61, "5. Prop firm"),
+    P("TrailingDrawdown", "double", 2500, 0, 1_000_000, "Trailing drawdown ($)",
+      62, "5. Prop firm"),
+    P("TrailOnUnrealized", "bool", True, 0, 1,
+      "Trail on unrealized equity (Apex) vs end-of-day (Topstep)", 63, "5. Prop firm"),
+    P("LockThresholdAt", "double", 50100, 0, 10_000_000,
+      "Threshold locks at ($; 0 = never)", 64, "5. Prop firm"),
+    P("DailyLossLimit", "double", 0, 0, 1_000_000,
+      "Daily loss limit ($; 0 = none)", 65, "5. Prop firm"),
+    P("PropBuffer", "double", 100, 0, 100_000, "Stop this far short ($)", 66,
+      "5. Prop firm"),
+    P("FlattenTime", "int", 155500, 0, 235959,
+      "Flatten at (HHmmss, chart time; 0 = off)", 67, "5. Prop firm"),
+]
+
 COMMON = [
     P("Quantity", "int", 1, 1, 1000000, "Quantity", 90, "3. Execution"),
     P("StopLossPercent", "double", 1.5, 0.05, 50, "Stop loss (%)", 91, "3. Execution"),
@@ -246,8 +265,237 @@ def _spec(name):
                        "\t\t\telse signal = 0;\n"),
             "warmup": "80",
         }
+    return _equity_spec(name)
+
+
+def _equity_spec(name):
+    """US-equity daily rules. These gate themselves on the 200-day line, so they
+    do not get the ADX regime filter the crypto templates carry."""
+    if name == "sma200_trend":
+        return {
+            "cls": "KryptSma200Trend", "family": "trend", "regime": False,
+            "desc": "Long while price is above its 200-day average. KRYPT sma200_trend.",
+            "params": [P("TrendLen", "int", 200, 5, 1000, "Trend SMA length", 1)],
+            "fields": "\t\tprivate SMA trendMa;\n",
+            "init": "\t\t\t\ttrendMa = SMA(Close, TrendLen);\n",
+            "signal": "\t\t\tsignal = Close[0] > trendMa[0] ? 1 : 0;\n",
+            "warmup": "TrendLen + 5",
+        }
+    if name == "golden_cross":
+        return {
+            "cls": "KryptGoldenCross", "family": "trend", "regime": False,
+            "desc": "Long while the 50-day is above the 200-day. KRYPT golden_cross.",
+            "params": [P("FastLen", "int", 50, 2, 500, "Fast SMA", 1),
+                       P("SlowLen", "int", 200, 5, 1000, "Slow SMA", 2)],
+            "fields": "\t\tprivate SMA fastMa;\n\t\tprivate SMA slowMa;\n",
+            "init": "\t\t\t\tfastMa = SMA(Close, FastLen);\n"
+                    "\t\t\t\tslowMa = SMA(Close, SlowLen);\n",
+            "signal": "\t\t\tsignal = fastMa[0] > slowMa[0] ? 1 : 0;\n",
+            "warmup": "SlowLen + 5",
+        }
+    if name == "connors_rsi2":
+        return {
+            "cls": "KryptConnorsRsi2", "family": "reversion", "regime": False,
+            "desc": ("RSI(2) oversold inside a 200-day uptrend, exit on the 5-day "
+                     "mean. KRYPT connors_rsi2."),
+            "params": [P("RsiLen", "int", 2, 1, 50, "RSI length", 1),
+                       P("Oversold", "double", 10, 1, 50, "Entry below RSI", 2),
+                       P("TrendLen", "int", 200, 5, 1000, "Trend SMA", 3),
+                       P("ExitLen", "int", 5, 2, 100, "Exit SMA", 4)],
+            "fields": ("\t\tprivate RSI rsiFast;\n\t\tprivate SMA trendMa, exitMa;\n"
+                       "\t\tprivate int connorsPos;\n"),
+            "init": ("\t\t\t\trsiFast = RSI(Close, RsiLen, 1);\n"
+                     "\t\t\t\ttrendMa = SMA(Close, TrendLen);\n"
+                     "\t\t\t\texitMa = SMA(Close, ExitLen);\n"
+                     "\t\t\t\tconnorsPos = 0;\n"),
+            # the state machine lives in a field: entry and exit are different
+            # conditions, so a stateless "is oversold now" rule is a different
+            # strategy from the one that was backtested
+            "signal": ("\t\t\tif (connorsPos == 0)\n"
+                       "\t\t\t{\n"
+                       "\t\t\t\tif (Close[0] > trendMa[0] && rsiFast[0] < Oversold)\n"
+                       "\t\t\t\t\tconnorsPos = 1;\n"
+                       "\t\t\t}\n"
+                       "\t\t\telse if (Close[0] > exitMa[0] || Close[0] < trendMa[0])\n"
+                       "\t\t\t\tconnorsPos = 0;\n"
+                       "\t\t\tsignal = connorsPos;\n"),
+            "warmup": "TrendLen + 10",
+        }
+    if name == "ibs_reversion":
+        return {
+            "cls": "KryptIbsReversion", "family": "reversion", "regime": False,
+            "desc": ("Internal Bar Strength: close in the bottom of the day's range "
+                     "inside an uptrend, one-bar hold. KRYPT ibs_reversion."),
+            "params": [P("IbsLevel", "double", 0.2, 0.01, 0.9, "IBS below", 1),
+                       P("TrendLen", "int", 200, 5, 1000, "Trend SMA", 2)],
+            "fields": "\t\tprivate SMA trendMa;\n",
+            "init": "\t\t\t\ttrendMa = SMA(Close, TrendLen);\n",
+            "signal": ("\t\t\tdouble rng = High[0] - Low[0];\n"
+                       "\t\t\tdouble ibs = rng > 0 ? (Close[0] - Low[0]) / rng : 0.5;\n"
+                       "\t\t\tsignal = (ibs < IbsLevel && Close[0] > trendMa[0]) ? 1 : 0;\n"),
+            "warmup": "TrendLen + 5",
+        }
+    if name == "gap_fade":
+        return {
+            "cls": "KryptGapFade", "family": "reversion", "regime": False,
+            "desc": "Fade a down-gap while the 200-day trend holds. KRYPT gap_fade.",
+            "params": [P("GapPercent", "double", 1.0, 0.05, 20, "Down-gap size (%)", 1),
+                       P("TrendLen", "int", 200, 5, 1000, "Trend SMA", 2)],
+            "fields": "\t\tprivate SMA trendMa;\n",
+            "init": "\t\t\t\ttrendMa = SMA(Close, TrendLen);\n",
+            "signal": ("\t\t\tdouble gap = Close[1] > 0 ? (Open[0] / Close[1] - 1) * 100 : 0;\n"
+                       "\t\t\tsignal = (gap < -GapPercent && Close[0] > trendMa[0]) ? 1 : 0;\n"),
+            "warmup": "TrendLen + 5",
+        }
+    if name == "turn_of_month":
+        return {
+            "cls": "KryptTurnOfMonth", "family": "calendar", "regime": False,
+            "desc": ("Hold across the turn of the month. KRYPT turn_of_month.\n"
+                     "//  NOTE: the Python version counts TRADING days inside the "
+                     "month; a live\n//  strategy cannot know which day is the last "
+                     "one until it has passed, so\n//  this uses calendar days near "
+                     "the boundary instead. Same idea, not the\n//  same rule - "
+                     "expect small differences from the backtest."),
+            "params": [P("DaysBefore", "int", 3, 1, 10, "Calendar days before month end", 1),
+                       P("DaysAfter", "int", 3, 1, 10, "Trading days into the month", 2)],
+            "fields": "",
+            "init": "",
+            "signal": ("\t\t\tint dom = Time[0].Day;\n"
+                       "\t\t\tint dim = DateTime.DaysInMonth(Time[0].Year, Time[0].Month);\n"
+                       "\t\t\tsignal = (dom > dim - DaysBefore || dom <= DaysAfter) ? 1 : 0;\n"),
+            "warmup": "5",
+        }
+    if name == "momentum_12_1":
+        return {
+            "cls": "KryptMomentum121", "family": "trend", "regime": False,
+            "desc": ("12-month momentum skipping the last month. KRYPT momentum_12_1."),
+            "params": [P("LookbackBars", "int", 252, 20, 2000, "Lookback (bars)", 1),
+                       P("SkipBars", "int", 21, 0, 200, "Skip recent (bars)", 2)],
+            "fields": "",
+            "init": "",
+            "signal": ("\t\t\tdouble past = Close[LookbackBars + SkipBars];\n"
+                       "\t\t\tsignal = (past > 0 && Close[SkipBars] / past - 1 > 0) ? 1 : 0;\n"),
+            "warmup": "LookbackBars + SkipBars + 5",
+        }
+    if name == "high52_breakout":
+        return {
+            "cls": "KryptHigh52Breakout", "family": "trend", "regime": False,
+            "desc": ("New 52-week high, held until the 200-day line breaks. "
+                     "KRYPT high52_breakout."),
+            "params": [P("Lookback", "int", 252, 20, 2000, "Highest-high lookback", 1),
+                       P("TrendLen", "int", 200, 5, 1000, "Exit SMA", 2)],
+            "fields": ("\t\tprivate MAX hiN;\n\t\tprivate SMA trendMa;\n"
+                       "\t\tprivate int breakoutPos;\n"),
+            "init": ("\t\t\t\thiN = MAX(High, Lookback);\n"
+                     "\t\t\t\ttrendMa = SMA(Close, TrendLen);\n"
+                     "\t\t\t\tbreakoutPos = 0;\n"),
+            "signal": ("\t\t\tif (breakoutPos == 0)\n"
+                       "\t\t\t{\n"
+                       "\t\t\t\tif (Close[0] >= hiN[1]) breakoutPos = 1;\n"
+                       "\t\t\t}\n"
+                       "\t\t\telse if (Close[0] < trendMa[0]) breakoutPos = 0;\n"
+                       "\t\t\tsignal = breakoutPos;\n"),
+            "warmup": "Math.Max(Lookback, TrendLen) + 5",
+        }
+    if name in ("vix_calm", "vix_spike_reversal"):
+        raise KeyError(
+            f"'{name}' needs a VIX data series. NinjaTrader can add one with "
+            "AddDataSeries(\"^VIX\"), but availability depends on your data "
+            "provider, so it is not generated blind - wire it up by hand if your "
+            "feed carries VIX.")
     raise KeyError(f"no NinjaScript template for strategy '{name}'")
 
+
+PROP_FIELDS = """		private double propPeak, propDayStart;
+		private bool propHalted, propInit;
+		private DateTime propDay;
+"""
+
+PROP_METHOD = r"""
+		/// <summary>
+		/// Prop-firm guardrails (Apex / Topstep style), enforced bar by bar.
+		/// Returns false when trading must stop.
+		///
+		/// The trailing drawdown is the rule that ends most evaluations, and it is
+		/// the one people model wrong: at Apex it follows your UNREALIZED equity
+		/// high, so an open winner raises the kill line and giving that winner back
+		/// breaches it even though the day is green. Topstep instead trails the
+		/// END-OF-DAY balance and adds an intraday daily loss limit. Both are
+		/// selectable below; set them to the account you actually have.
+		///
+		/// The buffer exists because being flat one tick before the line is the same
+		/// as being flat one tick after it, except the account still exists.
+		/// </summary>
+		private bool PropGuardOk()
+		{
+			if (!UsePropGuard) return true;
+
+			double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+			double open = Position.MarketPosition == MarketPosition.Flat ? 0
+				: Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]);
+			double equity = PropStartBalance + realized + open;
+
+			if (!propInit)
+			{
+				propPeak = PropStartBalance;
+				propDayStart = equity;
+				propDay = Time[0].Date;
+				propInit = true;
+			}
+
+			// day roll: Topstep-style trailing updates here, and the daily loss
+			// limit resets from the new session's opening equity
+			if (Time[0].Date != propDay)
+			{
+				if (!TrailOnUnrealized) propPeak = Math.Max(propPeak, equity);
+				propDay = Time[0].Date;
+				propDayStart = equity;
+			}
+
+			if (TrailOnUnrealized) propPeak = Math.Max(propPeak, equity);
+
+			// the threshold stops trailing once it reaches the lock level
+			double threshold = propPeak - TrailingDrawdown;
+			if (LockThresholdAt > 0) threshold = Math.Min(threshold, LockThresholdAt);
+
+			if (equity <= threshold + PropBuffer)
+			{
+				PropStop(string.Format("trailing drawdown: equity {0:C0} vs threshold {1:C0}",
+					equity, threshold));
+				return false;
+			}
+			if (DailyLossLimit > 0 && (equity - propDayStart) <= -(DailyLossLimit - PropBuffer))
+			{
+				PropStop(string.Format("daily loss limit: {0:C0} today",
+					equity - propDayStart));
+				return false;
+			}
+
+			// flat before the session close - no prop account allows overnight risk
+			if (FlattenTime > 0 && ToTime(Time[0]) >= FlattenTime)
+			{
+				FlattenNow("session close");
+				return false;
+			}
+			return true;
+		}
+
+		private void PropStop(string why)
+		{
+			if (!propHalted)
+			{
+				propHalted = true;
+				Print(Time[0] + "  PROP GUARD STOP - " + why);
+			}
+			FlattenNow(why);
+		}
+
+		private void FlattenNow(string why)
+		{
+			if (Position.MarketPosition == MarketPosition.Long) ExitLong("PropFlat", "");
+			else if (Position.MarketPosition == MarketPosition.Short) ExitShort("PropFlat", "");
+		}
+"""
 
 CONFLUENCE_METHOD = r"""
 		/// <summary>
@@ -442,32 +690,84 @@ def _wrap_comment(text, prefix="//   ", width=78):
     return "\n".join(out)
 
 
-def generate(name, report=None, *, quantity=1, allow_short=True):
-    """Return (filename, C# source) for one strategy."""
+def generate(name, report=None, *, quantity=1, allow_short=True, rules=None):
+    """Return (filename, C# source) for one strategy.
+
+    `rules` is a propfirm.PropRules: when given, the generated file ships
+    pre-configured for that account (balance, trailing drawdown, trail mode,
+    lock level, daily loss limit, contract cap) instead of generic defaults.
+    """
     spec = _spec(name)
-    regime_cmp, regime_on, regime_why = _regime_choice(name, report, spec["family"])
-    params = list(spec["params"]) + COMMON + [
+    uses_regime = spec.get("regime", True)
+    regime_cmp, regime_on, regime_why = (
+        _regime_choice(name, report, spec["family"]) if uses_regime
+        else ("<=", False, ""))
+    regime_params = [
         P("UseRegimeFilter", "bool", None, 0, 1,
           "Use ADX regime filter", 80, "2. Regime filter"),
         P("RegimeAdxPeriod", "int", 14, 2, 500, "Regime ADX period", 81, "2. Regime filter"),
         P("RegimeAdxLevel", "double", 25, 1, 100,
           ("Max ADX to enter (chop)" if regime_cmp == "<="
            else "Min ADX to enter (trend)"), 82, "2. Regime filter"),
+    ] if uses_regime else []
+    params = list(spec["params"]) + COMMON + PROP_PARAMS + regime_params + [
         P("AllowShorts", "bool", allow_short, 0, 1, "Allow shorts", 93, "3. Execution"),
+        P("MaxPropContracts", "int", 10, 1, 1000, "Max contracts allowed", 68,
+          "5. Prop firm"),
         P("UseTimeFilter", "bool", False, 0, 1, "Restrict trading hours", 84, "4. Session"),
         P("StartHour", "int", 0, 0, 23, "Start hour (chart time)", 85, "4. Session"),
         P("EndHour", "int", 23, 0, 23, "End hour (chart time)", 86, "4. Session"),
     ]
+    prop_defaults = {}
+    if rules is not None:
+        lock = {"start_plus_100": rules.starting_balance + 100,
+                "start": rules.starting_balance}.get(rules.trail_lock, 0)
+        prop_defaults = {
+            "PropStartBalance": rules.starting_balance,
+            "TrailingDrawdown": rules.max_drawdown,
+            "TrailOnUnrealized": rules.trail_mode == "intraday",
+            "LockThresholdAt": lock,
+            "DailyLossLimit": rules.daily_loss_limit or 0,
+            "MaxPropContracts": rules.max_contracts,
+        }
     for p in params:
         if p["name"] == "Quantity":
             p["default"] = quantity
         elif p["name"] == "UseRegimeFilter":
             p["default"] = regime_on
+        elif p["name"] in prop_defaults:
+            p["default"] = prop_defaults[p["name"]]
     cls = spec["cls"]
     ev = _evidence_block(name, report)
+    if rules is not None:
+        ev += (f"//\n//  PROP ACCOUNT: {rules.label} — target "
+               f"${rules.profit_target:,.0f}, trailing drawdown "
+               f"${rules.max_drawdown:,.0f} ({rules.trail_mode}"
+               f"{', locks at start' if rules.trail_lock != 'none' else ''})"
+               + (f", daily loss limit ${rules.daily_loss_limit:,.0f}"
+                  if rules.daily_loss_limit else ", no daily loss limit") + "\n"
+               + _wrap_comment(f"Rules snapshot: {rules.as_of}. {rules.notes}") + "\n")
     extra = CONFLUENCE_METHOD if name == "confluence" else ""
-    regime_comment = _wrap_comment(regime_why)
-    regime_default = "ON" if regime_on else "OFF"
+    if uses_regime:
+        regime_fields = "\t\tprivate ADX regimeAdx;\n"
+        regime_init = "\t\t\t\tregimeAdx = ADX(Close, RegimeAdxPeriod);\n"
+        regime_gate = (
+            "\t\t\t// --- regime gate (see the REGIME FILTER note in the header)\n"
+            f"\t\t\tif (UseRegimeFilter && signal != 0 && !(regimeAdx[0] {regime_cmp} "
+            "RegimeAdxLevel))\n\t\t\t\tsignal = 0;\n\n")
+        regime_header = (f"//  REGIME FILTER  (ADX {regime_cmp} RegimeAdxLevel, "
+                         f"default {'ON' if regime_on else 'OFF'})\n"
+                         f"{_wrap_comment(regime_why)}\n//\n")
+    else:
+        regime_fields = regime_init = regime_gate = ""
+        regime_header = _wrap_comment(
+            "REGIME FILTER: none. This rule gates itself on its own trend filter "
+            "(the 200-day line), so bolting an ADX gate on top would be two "
+            "regime filters fighting each other.", prefix="//  ") + "\n//\n"
+    meta = (report or {}).get("meta") or {}
+    src = (f"{meta.get('symbol', 'crypto')} {meta.get('interval', '')} bars".strip()
+           if meta else "crypto spot bars")
+    sample_note = (f"//   * Measured on {src}, with bar-close fills, no funding,\n")
     props = "\n".join(_prop(p) for p in params)
     defaults = "\n".join(_default_assign(p) for p in params)
 
@@ -479,12 +779,9 @@ def generate(name, report=None, *, quantity=1, allow_short=True):
 //
 //  WHAT THE ANALYSIS MEASURED
 {ev}//
-//  REGIME FILTER  (ADX {regime_cmp} RegimeAdxLevel, default {regime_default})
-{regime_comment}
-//
+{regime_header}//
 //  BEFORE YOU RUN THIS ON MONEY
-//   * These numbers come from CRYPTO spot bars with bar-close fills, no funding,
-//     no latency, no partial fills — a different market, feed and broker than the
+{sample_note}//     no latency, no partial fills — a different market, feed and broker than the
 //     one NinjaTrader is pointed at. Re-run it in Strategy Analyzer on YOUR
 //     instrument and YOUR costs; expect the result to be worse.
 //   * Hour-of-day findings in the KRYPT report are UTC. The session filter below
@@ -498,7 +795,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 {{
 	public class {cls} : Strategy
 	{{
-{spec['fields']}		private ADX regimeAdx;
+{spec['fields']}{PROP_FIELDS}{regime_fields}
 
 		protected override void OnStateChange()
 		{{
@@ -530,8 +827,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}}
 			else if (State == State.DataLoaded)
 			{{
-{spec['init']}				regimeAdx = ADX(Close, RegimeAdxPeriod);
-				SetStopLoss(CalculationMode.Percent, StopLossPercent / 100.0);
+{spec['init']}{regime_init}				SetStopLoss(CalculationMode.Percent, StopLossPercent / 100.0);
 				SetProfitTarget(CalculationMode.Percent, ProfitTargetPercent / 100.0);
 			}}
 		}}
@@ -541,13 +837,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (BarsInProgress != 0) return;
 			if (CurrentBar < Math.Max(BarsRequiredToTrade, {spec['warmup']})) return;
 
+			// prop-firm rules come FIRST: a breached account cannot trade a signal
+			if (propHalted) return;
+			if (!PropGuardOk()) return;
+
 			int signal = 0;
 {spec['signal']}
-			// --- regime gate (see the REGIME FILTER note in the header)
-			if (UseRegimeFilter && signal != 0 && !(regimeAdx[0] {regime_cmp} RegimeAdxLevel))
-				signal = 0;
-
-			// --- session gate (CHART time, not UTC)
+{regime_gate}			// --- session gate (CHART time, not UTC)
 			if (UseTimeFilter && signal != 0)
 			{{
 				int h = Time[0].Hour;
@@ -558,6 +854,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}}
 
 			if (!AllowShorts && signal < 0) signal = 0;
+			if (UsePropGuard && Quantity > MaxPropContracts) signal = 0;
 
 			// --- position management: the signal IS the desired position, so a flip
 			// closes and reverses on the same bar, exactly like the KRYPT backtest.
@@ -571,7 +868,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				else ExitShort();
 			}}
 		}}
-{extra}
+{PROP_METHOD}{extra}
 		#region Properties
 {props}		#endregion
 	}}
@@ -623,13 +920,14 @@ evidence for it in the file header.
 """
 
 
-def export(names, report=None, outdir="ninja", *, quantity=1, allow_short=True):
+def export(names, report=None, outdir="ninja", *, quantity=1, allow_short=True,
+           rules=None):
     """Write strategy files (+ a README) and return the paths written."""
     os.makedirs(outdir, exist_ok=True)
     written = []
     for name in names:
         fname, code = generate(name, report, quantity=quantity,
-                               allow_short=allow_short)
+                               allow_short=allow_short, rules=rules)
         path = os.path.join(outdir, fname)
         with open(path, "w") as f:
             f.write(code)

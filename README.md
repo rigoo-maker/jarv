@@ -215,6 +215,81 @@ Read it with the sample in mind: one stock, in a 15-year uptrend, with no 2008 i
 the window — precisely the conditions where a 200-day filter cannot win. The same
 maps on a bear-inclusive range are the interesting follow-up.
 
+## Prop-firm rules (Apex, Topstep)
+
+A funded-account evaluation is not a small trading account — it is a different
+game, and a strategy with a genuine edge can be structurally unable to pass it:
+
+| Rule | Why it kills strategies |
+|------|-------------------------|
+| **Trailing drawdown** | The kill line follows equity **up** and never comes back down. Run +$4,000 then give back $2,600 and an Apex 50k is dead — while showing +$1,400. |
+| **Trails on *unrealized* equity** (Apex) | Your open profit raises the line. Letting a winner run, then giving it back, is the classic blow-up. |
+| **Daily loss limit** (Topstep) | One bad session ends it, whatever the equity curve looks like. |
+| **No overnight positions** | Everything must be flat before the close. Every swing strategy is disqualified before Sharpe is even discussed. |
+| **Consistency** | One monster day can void a payout even when the total is fine. |
+
+```bash
+# would these strategies pass an evaluation, and at what size?
+python3 -m krypt.app prop --source csv --file nasdq.csv --strats equity \
+        --firm topstep-50k --contract MNQ --qty-sweep 1,2,3,4
+
+# add the pass-rate map to the HTML report
+python3 -m krypt.app heatmap --source csv --file nasdq.csv --strats equity \
+        --prop --firm apex-50k
+
+# emit NinjaScript with those rules compiled in
+python3 -m krypt.app ninja --strategy connors_rsi2 --strats equity \
+        --firm topstep-50k --prop
+```
+
+Presets: `apex-25k/50k/75k/100k/150k/250k/300k`, `topstep-50k/100k/150k` — or pass
+a JSON file to `--firm` to override any field. **Rule numbers change**; every
+preset carries an `as_of` marker and prints it with the results. Verify against
+the firm's current rulebook before trusting a PASS.
+
+### Evaluated from many start dates, not one
+
+`prop` doesn't run one evaluation — it starts one every `--stride` bars and
+reports the **distribution**. Passing once from a lucky start is an anecdote; a
+strategy that passes 20% of the time is a strategy that fails 80% of the time,
+and both numbers describe the same strategy.
+
+### What it found on NDAQ dailies
+
+Every strategy failed instantly on `held a position overnight` — which is the
+correct answer, not a bug: **Apex and Topstep are intraday games**, and daily
+swing rules cannot play. With that rule disabled to see the P&L side
+(`--allow-overnight`, a counterfactual only), Topstep 50k on MNQ:
+
+| strategy | 1 contract | 2 | 3 | 4 |
+|---|---|---|---|---|
+| connors_rsi2 | **20%** | 4% | 2% | 0% |
+| turn_of_month | 13% | 4% | 0% | 0% |
+| vix_spike_reversal | 12% | 4% | 0% | 0% |
+| sma200_trend | 0% | 0% | 0% | 0% |
+
+Size is the lever, and it is brutal. The drawdown is a **fixed number of dollars**
+while your swings scale with contracts, so pass probability collapses long before
+expectancy does. The best size is the smallest one that can still reach the target
+in time — almost never the maximum the firm allows.
+
+### Live guardrails, not just backtests
+
+`propfirm.PropGuard` enforces the same rules on a running account and plugs into
+`RiskEngine`: it tracks the trailing threshold against **unrealized** equity, halts
+a configurable buffer *before* the line (being flat one tick early beats one tick
+late), enforces the daily loss limit against the session's opening equity, and
+caps contracts. `risk.snapshot()["prop"]` exposes threshold, room and day P&L.
+
+Generated NinjaScript carries the same logic — `PropGuardOk()` runs before any
+signal, flattens on breach, and flattens at `FlattenTime` so nothing goes
+overnight. With `--prop` the account's numbers are compiled into the file's
+defaults.
+
+**Caveat that matters:** bar-close data approximates intrabar breaches from each
+bar's high/low, and the firms enforce tick by tick. Treat every pass rate here as
+an optimistic ceiling.
+
 ## Exporting to NinjaTrader (NinjaScript)
 
 The strategies that survive the maps can be emitted as NinjaTrader 8 C# strategies:
@@ -283,6 +358,12 @@ and even then conservatively.
   steps, so a loss is exactly as loud as an equal gain, in light and dark.
 - **`ninjascript.py`** — NinjaTrader 8 exporter: all 10 strategies as C#, with
   the measured evidence and a data-derived regime filter in each header.
+- **`propfirm.py`** — Apex/Topstep rulebooks as an engine: trailing drawdown
+  (unrealized vs end-of-day), daily loss limits, consistency, contract caps,
+  evaluation across many start dates, and a live `PropGuard`.
+- **`strats_equity.py`** — 10 US-equity daily rules (200-day gating, RSI(2)
+  reversion, calendar and VIX effects), long/flat by design.
+- **`csvdata.py`** — OHLCV loader for Kaggle dumps and broker exports.
 - **`risk.py`** — position sizing, limits, daily-loss + kill-switch halts.
 - **`trader.py`** — analyze/paper/live execution with audit logging.
 - **`binance_client.py`** — stdlib REST client (public data + signed trading,
