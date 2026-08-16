@@ -1,0 +1,19 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Generated dashboards & runtime artifacts
+crypto_dashboard.html
+krypt_dashboard.html
+krypt_live.html
+krypt_heatmaps.html
+krypt_audit.jsonl
+
+# Generated NinjaScript exports + bulk-data cache
+ninja/
+data/
+
+# Python
+__pycache__/
+*.pyc
