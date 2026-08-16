@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import math
 
+import time
+
 from . import backtest as bt
 from . import indicators
 from . import strats as stratlib
@@ -53,7 +55,34 @@ YEAR_SECS = 365 * 24 * 3600
 
 
 def bars_per_year(interval: str) -> float:
+    """Fallback only — assumes a 24/7 calendar. Prefer `empirical_bars_per_year`."""
     return YEAR_SECS / INTERVAL_SECS.get(interval, 60)
+
+
+def empirical_bars_per_year(candles, interval="1m"):
+    """Annualization factor measured from the timestamps.
+
+    This matters more than it looks. A 24/7 assumption on US equity daily bars
+    counts 365 bars a year instead of ~252, inflating every Sharpe by ~20%; on
+    intraday equity bars (6.5h sessions) the error is nearly 2x. Counting the
+    bars the data actually contains handles weekends, holidays, half-days and
+    exchange hours without a calendar library.
+    """
+    if len(candles) < 3:
+        return bars_per_year(interval)
+    span = (candles[-1]["time"] - candles[0]["time"]) / 1000.0
+    if span <= 0:
+        return bars_per_year(interval)
+    return (len(candles) - 1) / (span / YEAR_SECS)
+
+
+def median_bar_secs(candles):
+    """Median spacing — the mean is wrecked by weekend gaps."""
+    if len(candles) < 3:
+        return 60.0
+    gaps = sorted(candles[i]["time"] - candles[i - 1]["time"]
+                  for i in range(1, len(candles)))
+    return gaps[len(gaps) // 2] / 1000.0
 
 
 # ------------------------------------------------------------------ math utils
@@ -87,15 +116,15 @@ def pearson(a, b):
     return max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy)))
 
 
-def ann_sharpe(rets, interval):
-    """Annualized Sharpe of a per-bar net-return series."""
+def ann_sharpe(rets, bpy):
+    """Annualized Sharpe of a per-bar net-return series. `bpy` = bars per year."""
     rets = [r for r in rets if r is not None]
     if len(rets) < 2:
         return 0.0
     sd = stdev(rets)
     if sd <= 1e-12:
         return 0.0
-    return mean(rets) / sd * math.sqrt(bars_per_year(interval))
+    return mean(rets) / sd * math.sqrt(bpy)
 
 
 def logistic(x, center=0.0, scale=1.0):
@@ -149,6 +178,22 @@ def bar_returns(pos, closes, cost):
     return out
 
 
+def _connors_at(close, sma_trend, sma5, rsi2, entry):
+    """Connors state machine at one (entry level, trend filter) pair."""
+    pos, out = 0, []
+    for i in range(len(close)):
+        if None in (sma_trend[i], sma5[i], rsi2[i]):
+            out.append(0)
+            continue
+        if pos == 0:
+            if close[i] > sma_trend[i] and rsi2[i] < entry:
+                pos = 1
+        elif close[i] > sma5[i] or close[i] < sma_trend[i]:
+            pos = 0
+        out.append(pos)
+    return out
+
+
 # ------------------------------------------------------------------- the maps
 
 class Analysis:
@@ -161,7 +206,8 @@ class Analysis:
 
     def __init__(self, symbol, interval, candles, registry=None, *, windows=12,
                  fee_bps=10.0, slippage_bps=2.0, allow_short=True, warmup=60,
-                 oos_frac=0.3, leverage=1.0):
+                 oos_frac=0.3, leverage=1.0, cache=None, extras=None,
+                 include_benchmark=True):
         self.symbol = symbol
         self.interval = interval
         self.candles = candles
@@ -174,9 +220,20 @@ class Analysis:
         self.warmup = warmup
         self.oos_frac = oos_frac
         self.leverage = leverage
-        self.cache = stratlib.precompute(candles)
+        # a caller can supply its own indicator cache (the equity library builds a
+        # different one) — otherwise the crypto precompute is used
+        self.cache = stratlib.precompute(candles) if cache is None else cache
+        self.extras = extras
         self.closes = self.cache["close"]
         self.n = len(candles)
+        self.bpy = empirical_bars_per_year(candles, interval)
+        self.bar_secs = median_bar_secs(candles)
+        # Buy-and-hold is not a strategy, it is the bar every strategy has to clear.
+        # Without it on the same axes, a long-biased rule in a rising market reads
+        # as edge when it is just beta with extra steps.
+        self.benchmark = "buy_hold" if include_benchmark else None
+        if include_benchmark and "buy_hold" not in self.registry:
+            self.registry["buy_hold"] = lambda cache, i: 1
         # per-strategy position + net return series (used by every per-bar map)
         self.pos = {}
         self.rets = {}
@@ -196,7 +253,7 @@ class Analysis:
         s = res.stats()
         eq = res.equity_curve
         rets = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
-        s["ann_sharpe"] = round(ann_sharpe(rets, self.interval), 2)
+        s["ann_sharpe"] = round(ann_sharpe(rets, self.bpy), 2)
         s["bars"] = b - a
         return s
 
@@ -212,7 +269,7 @@ class Analysis:
             "bars": len(rs),
             "mean_bps": round(mean(rs) * 1e4, 3),
             "total_pct": round((total - 1) * 100, 2),
-            "sharpe": round(ann_sharpe(rs, self.interval), 2),
+            "sharpe": round(ann_sharpe(rs, self.bpy), 2),
         }
 
     # -- 1. edge over time -------------------------------------------------
@@ -246,8 +303,11 @@ class Analysis:
         breakout does the opposite. If a strategy earns everywhere equally, be
         suspicious — that is usually drift, not edge.
         """
-        adx = self.cache["adx"]
-        atr = indicators.atr(self.candles, 14)
+        adx = self.cache.get("adx")
+        sma200 = self.cache.get("sma200")
+        if adx is None and sma200 is None:
+            return {"cols": [], "rows": []}
+        atr = self.cache.get("atr") or indicators.atr(self.candles, 14)
         volp = [(atr[i] / self.closes[i] * 100) if (atr[i] and self.closes[i]) else None
                 for i in range(self.n)]
         valid = sorted(v for v in volp[self.warmup:] if v is not None)
@@ -255,11 +315,28 @@ class Analysis:
             return {"cols": [], "rows": []}
         lo_q, hi_q = valid[len(valid) // 3], valid[2 * len(valid) // 3]
 
-        def trend_of(i):
-            a = adx[i]
-            if a is None:
-                return None
-            return "chop" if a < 20 else ("trend" if a < 30 else "strong")
+        if adx is not None:
+            trend_names = ("chop", "trend", "strong")
+
+            def trend_of(i):
+                a = adx[i]
+                if a is None:
+                    return None
+                return "chop" if a < 20 else ("trend" if a < 30 else "strong")
+        else:
+            # equity regime: the 200-day line, split by whether it is itself rising
+            trend_names = ("below-200", "above-200 flat", "above-200 rising")
+
+            def trend_of(i):
+                s200 = sma200[i]
+                if s200 is None:
+                    return None
+                if self.closes[i] < s200:
+                    return "below-200"
+                prev = sma200[i - 21] if i >= 21 else None
+                if prev is None:
+                    return None
+                return "above-200 rising" if s200 > prev else "above-200 flat"
 
         def vol_of(i):
             v = volp[i]
@@ -267,7 +344,7 @@ class Analysis:
                 return None
             return "lo-vol" if v <= lo_q else ("mid-vol" if v <= hi_q else "hi-vol")
 
-        combos = [(t, v) for t in ("chop", "trend", "strong")
+        combos = [(t, v) for t in trend_names
                   for v in ("lo-vol", "mid-vol", "hi-vol")]
         buckets = {c: [] for c in combos}
         for i in range(self.warmup, self.n):
@@ -286,7 +363,7 @@ class Analysis:
     # -- 3. session effects -------------------------------------------------
     def hour_matrix(self):
         """strategy x hour-of-day (UTC). Only meaningful on intraday bars."""
-        if INTERVAL_SECS.get(self.interval, 60) > 3600:
+        if self.bar_secs > 3600:          # daily bars have one hour, not twenty-four
             return {"cols": [], "rows": []}
         buckets = {h: [] for h in range(24)}
         for i in range(self.warmup, self.n):
@@ -317,7 +394,7 @@ class Analysis:
                 s = res.stats()
                 eq = res.equity_curve
                 rr = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
-                s["ann_sharpe"] = round(ann_sharpe(rr, self.interval), 2)
+                s["ann_sharpe"] = round(ann_sharpe(rr, self.bpy), 2)
                 cells.append(s)
             rows.append({"strategy": name, "cells": cells})
         return {"cols": cols, "rows": rows, "metric": "total_return_pct"}
@@ -381,7 +458,7 @@ class Analysis:
                 s = res.stats()
                 eq = res.equity_curve
                 rr = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
-                s["ann_sharpe"] = round(ann_sharpe(rr, self.interval), 2)
+                s["ann_sharpe"] = round(ann_sharpe(rr, self.bpy), 2)
                 cells.append(s)
             rows.append({"strategy": f"oversold {os_}", "cells": cells})
         return {"cols": cols, "rows": rows, "metric": "total_return_pct",
@@ -400,10 +477,112 @@ class Analysis:
             s = res.stats()
             eq = res.equity_curve
             rr = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
-            s["ann_sharpe"] = round(ann_sharpe(rr, self.interval), 2)
+            s["ann_sharpe"] = round(ann_sharpe(rr, self.bpy), 2)
             cells.append(s)
         return {"cols": cols, "rows": [{"strategy": "vwap_reversion", "cells": cells}],
                 "metric": "total_return_pct", "x_title": "band width from VWAP"}
+
+    def _stats_of(self, signal_fn):
+        """One full-sample backtest, annualized."""
+        res = bt.run_signal(self.cache, signal_fn, leverage=self.leverage,
+                            fee_bps=self.fee_bps, slippage_bps=self.slippage_bps,
+                            warmup=self.warmup, allow_short=self.allow_short)
+        st = res.stats()
+        eq = res.equity_curve
+        rr = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
+        st["ann_sharpe"] = round(ann_sharpe(rr, self.bpy), 2)
+        return st
+
+    def sweep_connors(self, thresholds=(5, 10, 15, 20, 25, 30),
+                      trend_lens=(50, 100, 150, 200, 250, 300)):
+        """Connors RSI(2) across entry level x trend-filter length.
+
+        The flagship equity mean-reversion rule, re-run over its own grid. Both
+        axes are things a person picks arbitrarily; if the result only works at
+        one pair, the person picked the answer, not the rule.
+        """
+        close, rsi2 = self.cache["close"], self.cache["rsi2"]
+        smas = {L: indicators.sma(close, L) for L in trend_lens}
+        sma5 = self.cache["sma5"]
+        cols = [{"label": str(L), "trend_len": L} for L in trend_lens]
+        rows = []
+        for thr in thresholds:
+            cells = []
+            for L in trend_lens:
+                state = _connors_at(close, smas[L], sma5, rsi2, thr)
+                cells.append(self._stats_of(lambda c, i, _s=state: _s[i]))
+            rows.append({"strategy": f"RSI2 < {thr}", "cells": cells})
+        return {"cols": cols, "rows": rows, "metric": "total_return_pct",
+                "title": "Connors RSI(2) robustness - entry level x trend filter",
+                "unit": "%", "fmt": 1, "col_title": "entry \\ trend SMA"}
+
+    def sweep_ibs(self, levels=(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40)):
+        """Internal Bar Strength threshold — the one-day reversion knob."""
+        sma200, ibs, close = self.cache["sma200"], self.cache["ibs"], self.cache["close"]
+        cols = [{"label": f"{L:g}", "level": L} for L in levels]
+        cells = []
+        for L in levels:
+            def fn(c, i, _L=L):
+                if ibs[i] is None or sma200[i] is None:
+                    return 0
+                return 1 if (ibs[i] < _L and close[i] > sma200[i]) else 0
+            cells.append(self._stats_of(fn))
+        return {"cols": cols, "rows": [{"strategy": "ibs_reversion", "cells": cells}],
+                "metric": "total_return_pct", "unit": "%", "fmt": 1,
+                "title": "IBS reversion robustness - close-in-range threshold",
+                "col_title": "IBS threshold"}
+
+    def sweeps(self):
+        """Whichever parameter grids the loaded strategy family actually has."""
+        out = []
+        if "rsi" in self.cache:
+            out.append({**self.sweep_rsi(),
+                        "title": "RSI reversion robustness - oversold x overbought",
+                        "unit": "%", "fmt": 1, "col_title": "oversold \\ overbought"})
+            out.append({**self.sweep_vwap(),
+                        "title": "VWAP reversion robustness - band width",
+                        "unit": "%", "fmt": 1, "col_title": "band"})
+        if "rsi2" in self.cache:
+            out.append(self.sweep_connors())
+            out.append(self.sweep_ibs())
+        return out
+
+    def decomposition(self, wm):
+        """Where the market's own return came from: overnight vs the day session.
+
+        Equity-only and cost-free by construction — this is a decomposition of the
+        instrument, not a tradeable strategy (capturing the overnight leg means
+        paying the spread twice a day, which the cost map prices separately).
+        US equities have historically put most of their return in the overnight
+        gap; if that holds here, a close-to-close strategy is fighting the part of
+        the day that does not pay.
+        """
+        if "open" not in self.cache or not wm.get("cols"):
+            return {"cols": [], "rows": []}
+        op, cl = self.cache["open"], self.closes
+        legs = {
+            "overnight (close->open)": [0.0] + [(op[i] / cl[i - 1] - 1) if cl[i - 1] else 0.0
+                                                for i in range(1, self.n)],
+            "intraday (open->close)": [(cl[i] / op[i] - 1) if op[i] else 0.0
+                                       for i in range(self.n)],
+            "buy & hold (close->close)": [0.0] + [(cl[i] / cl[i - 1] - 1) if cl[i - 1] else 0.0
+                                                  for i in range(1, self.n)],
+        }
+        cols = [{"label": time.strftime("%Y-%m", time.gmtime(c["t0"])), **c}
+                for c in wm["cols"]]
+        rows = []
+        for name, ser in legs.items():
+            cells = []
+            for c in wm["cols"]:
+                seg = ser[c["start"]:c["end"]]
+                tot = 1.0
+                for r in seg:
+                    tot *= (1 + r)
+                cells.append({"total_return_pct": round((tot - 1) * 100, 2),
+                              "ann_sharpe": round(ann_sharpe(seg, self.bpy), 2),
+                              "bars": len(seg)})
+            rows.append({"strategy": name, "cells": cells})
+        return {"cols": cols, "rows": rows, "metric": "total_return_pct"}
 
     # -- 7. the answer: which edge is still ACTIVE --------------------------
     def active_edge(self, wm=None):
@@ -434,6 +613,17 @@ class Analysis:
         wsum = sum(wts) or 1.0
 
         split = int(self.warmup + (self.n - self.warmup) * (1 - self.oos_frac))
+
+        # the benchmark's own numbers, on identical bars and identical costs
+        bench = None
+        if self.benchmark and self.benchmark in self.registry:
+            bfull = self._run(self.warmup, self.n, self.registry[self.benchmark])
+            boos = self._run(split, self.n, self.registry[self.benchmark])
+            bench = {"full_sharpe": bfull["ann_sharpe"],
+                     "full_return_pct": bfull["total_return_pct"],
+                     "oos_sharpe": boos["ann_sharpe"],
+                     "oos_return_pct": boos["total_return_pct"]}
+
         out = []
         for row in wm["rows"]:
             name = row["strategy"]
@@ -450,7 +640,18 @@ class Analysis:
             is_ = self._run(self.warmup, split, self.registry[name])
             oos = self._run(split, self.n, self.registry[name])
 
-            rel = min(1.0, trades / 30.0) if trades else 0.0
+            exposure = (sum(1 for p in self.pos[name][self.warmup:] if p != 0)
+                        / max(1, self.n - self.warmup))
+            # "Too few bets to trust" has to scale with the bar size. 30 trades is
+            # a fair ask of a crypto minute strategy and an absurd one of a daily
+            # rule that holds for months — 15 years of dailies is ~50 trades for a
+            # 200-day trend rule, and that is the rule working as designed. The
+            # benchmark is exempt: buy-and-hold makes one bet by construction, and
+            # its Sharpe is estimated from every bar, not from its trade count.
+            min_trades = 30.0 if self.bar_secs <= 3600 else 12.0
+            thin_trades = 20 if self.bar_secs <= 3600 else 8
+            rel = 1.0 if name == self.benchmark else (
+                min(1.0, trades / min_trades) if trades else 0.0)
             blend = (0.30 * logistic(recent, 1.0, 0.7)
                      + 0.25 * logistic(oos["ann_sharpe"], 1.0, 0.7)
                      + 0.20 * hit
@@ -463,8 +664,19 @@ class Analysis:
             if oos["total_return_pct"] <= 0:
                 score = min(score, 45.0)
 
-            if trades < 20:
+            beats_bench = None
+            if bench and name != self.benchmark:
+                # risk-adjusted, on the same bars: matching buy-and-hold with a
+                # rule is not edge, it is beta you paid commissions for
+                beats_bench = (full["ann_sharpe"] > bench["full_sharpe"]
+                               and oos["ann_sharpe"] > bench["oos_sharpe"])
+
+            if name == self.benchmark:
+                verdict = "BENCHMARK"
+            elif trades < thin_trades:
                 verdict = "THIN SAMPLE"
+            elif beats_bench is False and full["total_return_pct"] > 0:
+                verdict = "BETA ONLY"
             elif score >= 65 and oos["ann_sharpe"] > 0 and hit >= 0.5:
                 verdict = "ACTIVE EDGE"
             elif score >= 50:
@@ -489,9 +701,13 @@ class Analysis:
                 "trades": trades,
                 "max_dd_pct": full["max_drawdown_pct"],
                 "profit_factor": full["profit_factor"],
+                "exposure": round(exposure, 3),
+                "beats_benchmark": beats_bench,
+                "is_benchmark": name == self.benchmark,
             })
         out.sort(key=lambda r: r["score"], reverse=True)
-        return {"rows": out, "oos_split_bar": split,
+        return {"rows": out, "oos_split_bar": split, "benchmark": bench,
+                "benchmark_name": self.benchmark,
                 "oos_bars": self.n - split, "windows": k}
 
     # -- everything, once ---------------------------------------------------
@@ -506,6 +722,10 @@ class Analysis:
                 "fee_bps": self.fee_bps, "slippage_bps": self.slippage_bps,
                 "allow_short": self.allow_short, "leverage": self.leverage,
                 "warmup": self.warmup, "oos_frac": self.oos_frac,
+                "bars_per_year": round(self.bpy, 1),
+                "bar_secs": self.bar_secs,
+                "strategies": [n for n in self.registry if n != self.benchmark],
+                "benchmark": self.benchmark,
             },
             "windows": wm,
             "regimes": self.regime_matrix(),
@@ -513,8 +733,8 @@ class Analysis:
             "costs": self.cost_matrix(),
             "correlation": self.corr_matrix(),
             "overlap": self.overlap_matrix(),
-            "sweep_rsi": self.sweep_rsi(),
-            "sweep_vwap": self.sweep_vwap(),
+            "sweeps": self.sweeps(),
+            "decomposition": self.decomposition(wm),
             "edge": self.active_edge(wm),
         }
 
@@ -525,13 +745,24 @@ def print_edge_table(report):
     print(f"\n=== ACTIVE EDGE {meta['symbol']} {meta['interval']} "
           f"({meta['candles']} candles, {edge['windows']} windows, "
           f"{meta['fee_bps']}+{meta['slippage_bps']} bps costs) ===")
-    print(f"  {'strategy':<18}{'score':>7}{'verdict':>14}{'recentSh':>10}"
-          f"{'oosSh':>8}{'oosRet%':>9}{'hit':>6}{'decay':>7}{'trades':>8}")
+    print(f"  {'strategy':<20}{'score':>7}{'verdict':>14}{'fullSh':>8}"
+          f"{'oosSh':>8}{'oosRet%':>9}{'hit':>6}{'expo':>6}{'maxDD%':>8}{'trades':>8}")
     for r in edge["rows"]:
-        print(f"  {r['strategy']:<18}{r['score']:>7}{r['verdict']:>14}"
-              f"{r['recent_sharpe']:>10}{r['oos_sharpe']:>8}"
-              f"{r['oos_return_pct']:>9}{r['hit_rate']:>6}{r['decay']:>7}"
-              f"{r['trades']:>8}")
+        mark = "*" if r.get("is_benchmark") else " "
+        print(f"  {mark}{r['strategy']:<19}{r['score']:>7}{r['verdict']:>14}"
+              f"{r['full_sharpe']:>8}{r['oos_sharpe']:>8}"
+              f"{r['oos_return_pct']:>9}{r['hit_rate']:>6}"
+              f"{r.get('exposure', 0):>6}{r['max_dd_pct']:>8}{r['trades']:>8}")
+    b = edge.get("benchmark")
+    if b:
+        print(f"  * = benchmark. Buy & hold on the same bars and costs: "
+              f"Sharpe {b['full_sharpe']}, OOS Sharpe {b['oos_sharpe']}, "
+              f"OOS return {b['oos_return_pct']}%.")
+        print("  'BETA ONLY' = positive, but does not beat buy & hold on Sharpe "
+              "in-sample AND out-of-sample.")
+    print(f"  expo = fraction of bars holding a position; "
+          f"annualization = {meta.get('bars_per_year', '?')} bars/year "
+          "(measured from the timestamps, not assumed).")
     print(f"  Sharpe = annualized, net of costs. OOS = last "
           f"{int(meta['oos_frac']*100)}% of bars ({edge['oos_bars']} candles), "
           "held out of every other column.")

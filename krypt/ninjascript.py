@@ -583,8 +583,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 def recommend(report, top=3, min_score=45.0):
     """Which strategies are worth exporting, in the analysis's own order."""
     rows = report["edge"]["rows"]
+    # BETA ONLY and the benchmark are deliberately excluded: exporting a rule that
+    # loses to buy-and-hold, into a platform where it costs commissions to run, is
+    # worse than exporting nothing.
+    dead = {"NO EDGE", "BETA ONLY", "BENCHMARK"}
     keep = [r["strategy"] for r in rows
-            if r["score"] >= min_score and r["verdict"] != "NO EDGE"]
+            if r["score"] >= min_score and r["verdict"] not in dead]
     return keep[:top]
 
 

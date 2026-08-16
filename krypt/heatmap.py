@@ -220,8 +220,8 @@ def _heat_table(*, rows, cols, value_of, tip_of, label_of, row_label,
 
 def _verdict_badge(v):
     cls = {"ACTIVE EDGE": "good", "WEAK / WATCH": "warning",
-           "FADING": "serious", "NO EDGE": "critical",
-           "THIN SAMPLE": "muted"}.get(v, "muted")
+           "FADING": "serious", "NO EDGE": "critical", "BETA ONLY": "serious",
+           "BENCHMARK": "muted", "THIN SAMPLE": "muted"}.get(v, "muted")
     icon = {"good": "●", "warning": "▲", "serious": "▼", "critical": "✕",
             "muted": "○"}[cls]
     return f'<span class="badge {cls}"><span class="ic">{icon}</span>{_esc(v)}</span>'
@@ -231,10 +231,27 @@ def _edge_section(report):
     edge = report["edge"]
     meta = report["meta"]
     rows = edge["rows"]
-    best = rows[0] if rows else None
-    hero = ("—" if not best else
-            f'{_esc(best["strategy"])} <span class="hero-sub">'
-            f'score {best["score"]} · {_esc(best["verdict"])}</span>')
+    # The headline must state the FINDING, not just the top row. When the best
+    # rule is beta or noise, "sma200_trend, score 51.6" reads like a
+    # recommendation; the honest headline in that case is that nothing won.
+    ranked = [r for r in rows if not r.get("is_benchmark")]
+    best = ranked[0] if ranked else None
+    live = [r for r in ranked if r["verdict"] == "ACTIVE EDGE"]
+    if live:
+        top = live[0]
+        hero = (f'{_esc(top["strategy"])} <span class="hero-sub">score '
+                f'{top["score"]} · {_esc(top["verdict"])}</span>')
+    elif best and best["verdict"] == "BETA ONLY":
+        hero = ('Buy &amp; hold wins <span class="hero-sub">no rule here beats it '
+                f'risk-adjusted — best was {_esc(best["strategy"])} '
+                f'(score {best["score"]})</span>')
+    elif best:
+        hero = ('No edge on this sample <span class="hero-sub">best was '
+                f'{_esc(best["strategy"])} (score {best["score"]}, '
+                f'{_esc(best["verdict"])})</span>')
+    else:
+        hero = "—"
+    bench = edge.get("benchmark")
     trs = []
     for r in rows:
         w = max(0, min(100, r["score"]))
@@ -248,9 +265,20 @@ def _edge_section(report):
             f'<td class="num">{_fmt(r["oos_sharpe"])}</td>'
             f'<td class="num">{_fmt(r["oos_return_pct"], 2, "%")}</td>'
             f'<td class="num">{_fmt(r["hit_rate"], 2)}</td>'
-            f'<td class="num">{_fmt(r["decay"])}</td>'
+            f'<td class="num">{_fmt(100 * r.get("exposure", 0), 0, "%")}</td>'
             f'<td class="num">{_fmt(r["max_dd_pct"], 1, "%")}</td>'
             f'<td class="num">{r["trades"]}</td></tr>')
+    bench_note = ""
+    if bench:
+        bench_note = (
+            f'<p class="note"><b>The bar to clear.</b> Buy &amp; hold on the same '
+            f'bars and the same costs returned {bench["full_return_pct"]}% at '
+            f'Sharpe {bench["full_sharpe"]} (out-of-sample: '
+            f'{bench["oos_return_pct"]}% at Sharpe {bench["oos_sharpe"]}). A rule '
+            f'that does not beat that on risk-adjusted terms is labelled '
+            f'<b>BETA ONLY</b> — it is the market with extra commissions, not an '
+            f'edge. Exposure matters here: a rule holding 30% of the time for the '
+            f'same Sharpe is doing more with less risk.</p>')
     return f"""
 <section class="card">
   <h2>Which edge is still active</h2>
@@ -262,9 +290,10 @@ def _edge_section(report):
     <thead><tr><th>strategy</th><th>edge score</th><th>verdict</th>
       <th class="num">recent Sh</th><th class="num">in-samp Sh</th>
       <th class="num">OOS Sh</th><th class="num">OOS ret</th>
-      <th class="num">hit rate</th><th class="num">decay</th>
+      <th class="num">hit rate</th><th class="num">exposure</th>
       <th class="num">max DD</th><th class="num">trades</th></tr></thead>
     <tbody>{''.join(trs)}</tbody></table></div>
+  {bench_note}
   <p class="note"><b>How the score is built.</b> 30% recency-weighted window Sharpe
   (half-life ¼ of the sample) · 25% out-of-sample Sharpe · 20% hit rate across
   windows · 15% improving-vs-decaying · 10% full-sample Sharpe, scaled down when
@@ -371,45 +400,68 @@ def _corr_section(rep, key, title, lede):
 
 
 def _sweep_section(rep):
-    sw = rep["sweep_rsi"]
-    vw = rep["sweep_vwap"]
-    cols = list(range(len(sw["cols"])))
+    sweeps = rep.get("sweeps") or []
+    if not sweeps:
+        return ""
+    blocks = []
+    for sw in sweeps:
+        cols = list(range(len(sw["cols"])))
+
+        def val(r, c, _sw=sw):
+            return r["cells"][c].get(_sw.get("metric", "total_return_pct"))
+
+        def tip(r, c, _sw=sw):
+            cell = r["cells"][c]
+            return (f'{r["strategy"]} / {_sw["cols"][c]["label"]}\n'
+                    f'return {cell["total_return_pct"]}%  ·  Sharpe(ann) '
+                    f'{cell.get("ann_sharpe")}\n'
+                    f'trades {cell["trades"]}  ·  maxDD {cell["max_drawdown_pct"]}%')
+        blocks.append(
+            f'<h3>{_esc(sw.get("title", "parameter sweep"))}</h3>' +
+            _heat_table(rows=sw["rows"], cols=cols, value_of=val, tip_of=tip,
+                        label_of=lambda c, _sw=sw: _sw["cols"][c]["label"],
+                        row_label=lambda r: r["strategy"],
+                        col_title=sw.get("col_title", ""), unit=sw.get("unit", "%"),
+                        cell_fmt=sw.get("fmt", 1)))
+    return f"""
+<section class="card">
+  <h2>Robustness — plateau or spike?</h2>
+  <p class="lede">The same strategy re-run across its own parameter grid. A real
+  edge is a broad <b>plateau</b>: neighbours of the winning cell are also blue, so
+  being slightly wrong about the threshold still works. One hot cell in a cold
+  field is a curve fit, and it will not survive next month.</p>
+  {''.join(blocks)}
+</section>"""
+
+
+def _decomp_section(rep):
+    d = rep.get("decomposition") or {}
+    if not d.get("cols"):
+        return ""
+    cols = list(range(len(d["cols"])))
 
     def val(r, c):
         return r["cells"][c]["total_return_pct"]
 
     def tip(r, c):
         cell = r["cells"][c]
-        return (f'{r["strategy"]} / overbought {sw["cols"][c]["label"]}\n'
+        return (f'{r["strategy"]} · {d["cols"][c]["label"]}\n'
                 f'return {cell["total_return_pct"]}%  ·  Sharpe(ann) {cell["ann_sharpe"]}\n'
-                f'trades {cell["trades"]}  ·  maxDD {cell["max_drawdown_pct"]}%')
-    vcols = list(range(len(vw["cols"])))
-
-    def vval(r, c):
-        return r["cells"][c]["total_return_pct"]
-
-    def vtip(r, c):
-        cell = r["cells"][c]
-        return (f'band {vw["cols"][c]["label"]} from VWAP\n'
-                f'return {cell["total_return_pct"]}%  ·  Sharpe(ann) {cell["ann_sharpe"]}\n'
-                f'trades {cell["trades"]}')
+                f'{cell["bars"]} bars')
     return f"""
 <section class="card">
-  <h2>Mean-reversion robustness — plateau or spike?</h2>
-  <p class="lede">The same strategy re-run across its own parameter grid. A real
-  edge is a broad <b>plateau</b>: neighbours of the winning cell are also blue, so
-  being slightly wrong about the threshold still works. One hot cell in a cold
-  field is a curve fit, and it will not survive next month.</p>
-  <h3>RSI reversion · oversold × overbought</h3>
-  {_heat_table(rows=sw["rows"], cols=cols, value_of=val, tip_of=tip,
-               label_of=lambda c: sw["cols"][c]["label"],
-               row_label=lambda r: r["strategy"],
-               col_title=COL_RSI, unit="%", cell_fmt=1)}
-  <h3>VWAP reversion · band width</h3>
-  {_heat_table(rows=vw["rows"], cols=vcols, value_of=vval, tip_of=vtip,
-               label_of=lambda c: vw["cols"][c]["label"],
-               row_label=lambda r: r["strategy"],
-               col_title="band", unit="%", cell_fmt=1)}
+  <h2>Where the instrument's own return came from — overnight vs day session</h2>
+  <p class="lede">Not a strategy: the market's return split into the gap from close
+  to next open, and the move from open to close, per window. US equities have
+  historically paid most of their return overnight. If that holds here, every
+  close-to-close rule above is competing for the half of the day that pays less —
+  worth knowing before optimizing one. Costs are excluded (this is the instrument,
+  not a trade); capturing the overnight leg means paying the spread twice a day,
+  which the cost map prices separately.</p>
+  {_heat_table(rows=d["rows"], cols=cols, value_of=val, tip_of=tip,
+               label_of=lambda c: d["cols"][c]["label"],
+               row_label=lambda r: r["strategy"], col_title="leg", unit="%",
+               cell_fmt=1)}
 </section>"""
 
 
@@ -579,6 +631,7 @@ def render(report) -> str:
                       "trade at the same time, −1 = systematically opposite sides, 0 = "
                       "independent exposure. Correlation says results agree; this says "
                       "the positions themselves do."),
+        _decomp_section(report),
         _sweep_section(report),
     ])
     return f"""<!DOCTYPE html>

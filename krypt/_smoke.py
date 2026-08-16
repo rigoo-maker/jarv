@@ -6,6 +6,8 @@ and dashboard rendering on synthetic data, with NO network. Run:
 
 from __future__ import annotations
 
+import os
+
 from .config import load_config
 from . import indicators
 from .scoring import score_snapshot
@@ -103,11 +105,31 @@ def main():
         rows1[0]["strategy"], rows1[0]["total_return_pct"], liq10))
     assert liq10 >= 0  # leverage model wired
 
-    # edge analytics: every map + the active-edge ranking
+    # mark-to-market invariant: buy & hold must reproduce the instrument.
+    # Regression test for a real bug — booking P&L only on trade close made a
+    # held position a flat line with one jump, so drawdown measured ~0 and every
+    # Sharpe for a slow strategy was meaningless.
+    bh = bt.run_signal(strats.precompute(candles), lambda c, i: 1, fee_bps=0,
+                       slippage_bps=0, warmup=60, allow_short=False)
+    bh_stats = bh.stats()
+    price_move = (candles[-1]["close"] / candles[60]["close"] - 1) * 100
+    assert abs(bh_stats["total_return_pct"] - price_move) < 0.5, (
+        bh_stats["total_return_pct"], price_move)
+    peak = mdd = 0.0
+    for c in candles[60:]:
+        peak = max(peak, c["close"])
+        mdd = max(mdd, (peak - c["close"]) / peak * 100)
+    assert abs(bh_stats["max_drawdown_pct"] - mdd) < 1.0, (
+        bh_stats["max_drawdown_pct"], mdd)
+    print("mark2mkt  : buy&hold %+.1f%% vs price %+.1f%%, maxDD %.1f%% vs %.1f%%" % (
+        bh_stats["total_return_pct"], price_move, bh_stats["max_drawdown_pct"], mdd))
+
+    # edge analytics: every map + the active-edge ranking (+1 row = benchmark)
     from . import analytics as ana
     rep = ana.Analysis("BTCUSDT", "1m", candles, windows=4).run_all()
+    n_rows = len(strats.REGISTRY) + 1
     assert len(rep["windows"]["cols"]) == 4
-    assert len(rep["windows"]["rows"]) == len(strats.REGISTRY)
+    assert len(rep["windows"]["rows"]) == n_rows
     assert len(rep["regimes"]["cols"]) == 9          # 3 trend x 3 volatility
     assert len(rep["hours"]["cols"]) == 24
     assert len(rep["costs"]["cols"]) == 7
@@ -119,8 +141,10 @@ def main():
             assert (a is None and b is None) or abs(a - b) < 1e-9
     ov = rep["overlap"]["matrix"]
     assert all(v is None or -1.0001 <= v <= 1.0001 for row in ov for v in row)
+    assert rep["sweeps"] and all(m["rows"] and m["cols"] for m in rep["sweeps"])
     edge = rep["edge"]["rows"]
-    assert len(edge) == len(strats.REGISTRY)
+    assert len(edge) == n_rows
+    assert any(r["is_benchmark"] for r in edge)
     assert all(0 <= r["score"] <= 100 for r in edge)
     assert edge == sorted(edge, key=lambda r: r["score"], reverse=True)
     print("analytics : %d windows, %d regimes, %d cost levels; best=%s (%s, score %s)" % (
@@ -146,7 +170,7 @@ def main():
     # NinjaScript generation for every strategy
     from . import ninjascript as nj
     for name in strats.REGISTRY:
-        fname, code = nj.generate(name, rep)
+        fname, code = nj.generate(name, rep)  # benchmark has no template, by design
         assert code.count("{") == code.count("}"), name
         assert code.isascii(), name           # NinjaScript editors are not UTF-8 safe
         for needle in ("namespace NinjaTrader.NinjaScript.Strategies",
@@ -157,6 +181,66 @@ def main():
             assert needle in code, (name, needle)
     print("ninjascript: generated %d NinjaTrader 8 strategies (balanced braces, "
           "ASCII, evidence headers)" % len(strats.REGISTRY))
+
+    # CSV loader: header aliases, ambiguous slash dates, multi-symbol guard
+    import tempfile
+    from . import csvdata
+    with tempfile.TemporaryDirectory() as td:
+        p1 = os.path.join(td, "plain.csv")
+        from datetime import date, timedelta
+        with open(p1, "w") as f:
+            f.write("Date,Open,High,Low,Close,Volume,VIX\n")
+            for i, c in enumerate(candles[:50]):
+                d = date(2024, 1, 1) + timedelta(days=i)
+                f.write("%s,%s,%s,%s,%s,%s,%s\n" % (
+                    d.isoformat(), c["open"], c["high"], c["low"], c["close"],
+                    c["volume"], 15 + i % 10))
+        got, info = csvdata.load(p1, quiet=True)
+        assert len(got) == 50 and info["interval"] == "1d"
+        assert info["extras"][0]["vix"] == 15
+
+        p2 = os.path.join(td, "slash.csv")
+        with open(p2, "w") as f:                       # 25/12 proves DD/MM order
+            f.write("timestamp,o,h,l,c\n01/02/2024,1,2,0.5,1.5\n25/12/2024,1,2,0.5,1.6\n"
+                    "26/12/2024,1,2,0.5,1.7\n")
+        got2, info2 = csvdata.load(p2, quiet=True)
+        assert info2["date_format"] == "%d/%m/%Y", info2["date_format"]
+
+        p3 = os.path.join(td, "multi.csv")
+        with open(p3, "w") as f:
+            f.write("Date,Ticker,Open,High,Low,Close\n2024-01-01,AAA,1,2,0.5,1.5\n"
+                    "2024-01-01,BBB,1,2,0.5,1.5\n2024-01-02,AAA,1,2,0.5,1.6\n")
+        try:
+            csvdata.load(p3, quiet=True)
+            raise AssertionError("multi-symbol file should demand a symbol")
+        except csvdata.CsvError:
+            pass
+        one, _ = csvdata.load(p3, "AAA", quiet=True)
+        assert len(one) == 2
+    print("csvdata   : aliases, DD/MM detection, extras and multi-symbol guard OK")
+
+    # equity library: VIX rules present only when the data has VIX
+    from . import strats_equity as eqlib
+    # equity rules need DAILY spacing — re-stamp the synthetic bars one per day so
+    # the measured annualization factor is a daily one
+    daily = [{**c, "time": 1_600_000_000_000 + i * 86_400_000}
+             for i, c in enumerate(candles)]
+    ecache = eqlib.precompute(daily, [{"vix": 15 + i % 8} for i in range(len(daily))])
+    assert len(eqlib.registry(ecache)) == 10
+    assert len(eqlib.registry(eqlib.precompute(daily))) == 8
+    for name, fn in eqlib.registry(ecache).items():
+        vals = {fn(ecache, i) for i in range(len(daily))}
+        assert vals <= {0, 1}, (name, vals)       # long/flat only, by design
+    erep = ana.Analysis("TEST", "1d", daily, eqlib.registry(ecache), windows=4,
+                        cache=ecache, allow_short=False, warmup=100).run_all()
+    assert erep["regimes"]["cols"][0]["trend"] == "below-200"   # equity regime axis
+    assert erep["decomposition"]["rows"]                        # overnight vs intraday
+    # annualization is measured from timestamps: ~365 for these daily bars, and
+    # ~525,600 for the minute bars above — not a hardcoded crypto constant
+    assert 360 < erep["meta"]["bars_per_year"] < 370, erep["meta"]["bars_per_year"]
+    assert 500_000 < rep["meta"]["bars_per_year"] < 550_000
+    print("equity    : %d rules (10 with VIX / 8 without), regime axis = 200-day, "
+          "%.0f bars/yr" % (len(eqlib.registry(ecache)), erep["meta"]["bars_per_year"]))
 
     print("\nALL SMOKE CHECKS PASSED ✓")
 

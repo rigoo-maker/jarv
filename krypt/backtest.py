@@ -75,18 +75,28 @@ def run(candles, *, fee_bps=10.0, slippage_bps=2.0, start_equity=1000.0,
 def run_signal(cache, signal_fn, *, leverage=1.0, fee_bps=10.0, slippage_bps=2.0,
                start_equity=1000.0, compound=True, warmup=60, allow_short=True):
     """Backtest a signal strategy (+1/0/-1) over a precomputed `cache` (from
-    strats.precompute) with LEVERAGE and a liquidation model.
+    strats.precompute or strats_equity.precompute) with LEVERAGE and liquidation.
+
+    The equity curve is MARKED TO MARKET every bar. That sounds like a detail and
+    is not: booking P&L only when a trade closes makes a buy-and-hold position
+    look like a flat line with one jump at the end — zero measured drawdown,
+    meaningless Sharpe. Any strategy holding longer than a few bars (every daily
+    equity rule) was mis-measured that way. Unrealized P&L now moves the curve,
+    so drawdown means what it says.
+
+    Position size is fixed at ENTRY (equity at entry x leverage), not at exit, so
+    a trade cannot retroactively size itself off P&L it had not made yet.
 
     Liquidation is the honest part: a leveraged position is wiped when the adverse
-    move approaches 1/leverage (you can't lose more than your margin — you lose
-    ALL of it). This is why high leverage on a thin edge => ruin. The backtest
-    shows it instead of hiding it.
+    move approaches 1/leverage (you cannot lose more than your margin - you lose
+    ALL of it). This is why high leverage on a thin edge => ruin.
     """
     closes = cache["close"]
     n = len(closes)
-    equity = start_equity
-    pos = 0                 # -1, 0, +1
-    entry = 0.0
+    equity = start_equity        # realized equity (closed trades + fees)
+    pos = 0                      # -1, 0, +1
+    entry = 0.0                  # entry price
+    notional = 0.0               # position size in $, fixed at entry
     cost = (fee_bps + slippage_bps) / 1e4
     curve = [equity]
     trades = []
@@ -94,17 +104,32 @@ def run_signal(cache, signal_fn, *, leverage=1.0, fee_bps=10.0, slippage_bps=2.0
     liquidations = 0
     maint = 0.95 / max(leverage, 1.0)   # adverse fraction that liquidates
 
-    def close(px, i):
+    def unrealized(px):
+        if pos == 0 or entry <= 0:
+            return 0.0
+        return notional * ((px - entry) / entry) * pos
+
+    def open_pos(px, target):
+        nonlocal equity, pos, entry, notional, fees_paid
+        base = equity if compound else start_equity
+        notional = max(base, 0.0) * leverage
+        entry = px
+        pos = target
+        f = notional * cost
+        equity -= f
+        fees_paid += f
+
+    def close_pos(px, i):
         nonlocal equity, pos, fees_paid
         ret = ((px - entry) / entry) * pos
-        base = equity if compound else start_equity
-        pnl = base * leverage * ret
+        pnl = notional * ret
         equity += pnl
-        f = base * leverage * cost
+        f = notional * cost
         equity -= f
         fees_paid += f
         trades.append({"entry": entry, "exit": px, "ret": ret, "pnl": pnl,
                        "bars": i, "lev": leverage})
+        pos = 0
 
     for i in range(warmup, n):
         px = closes[i]
@@ -113,11 +138,10 @@ def run_signal(cache, signal_fn, *, leverage=1.0, fee_bps=10.0, slippage_bps=2.0
         if pos != 0 and leverage > 1.0:
             adverse = ((entry - px) / entry) if pos > 0 else ((px - entry) / entry)
             if adverse >= maint:
-                base = equity if compound else start_equity
-                equity -= base                      # margin wiped
-                equity = max(equity, 0.0)
+                margin = notional / max(leverage, 1.0)
+                equity = max(equity - margin, 0.0)      # margin wiped
                 trades.append({"entry": entry, "exit": px, "ret": -1.0,
-                               "pnl": -base, "bars": i, "lev": leverage,
+                               "pnl": -margin, "bars": i, "lev": leverage,
                                "liquidated": True})
                 liquidations += 1
                 pos = 0
@@ -131,18 +155,14 @@ def run_signal(cache, signal_fn, *, leverage=1.0, fee_bps=10.0, slippage_bps=2.0
             target = 0
         if target != pos:
             if pos != 0:
-                close(px, i)
+                close_pos(px, i)
             if target != 0 and equity > 0:
-                entry = px
-                base = equity if compound else start_equity
-                f = base * leverage * cost
-                equity -= f
-                fees_paid += f
-            pos = target
-        curve.append(equity)
+                open_pos(px, target)
+        curve.append(equity + unrealized(px))
 
     if pos != 0 and equity > 0:
-        close(closes[-1], n)
+        close_pos(closes[-1], n)
+        curve[-1] = equity
 
     res = BacktestResult(curve, trades, fees_paid,
                          {"leverage": leverage, "fee_bps": fee_bps,

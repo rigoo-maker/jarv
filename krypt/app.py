@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -33,6 +34,8 @@ from . import strats as stratlib
 from . import analytics as ana
 from . import heatmap as heatmapmod
 from . import ninjascript as nj
+from . import csvdata
+from . import strats_equity as eqlib
 from .scoring import score_snapshot
 from datetime import date, timedelta
 
@@ -164,14 +167,29 @@ def cmd_backtest(cfg, days, limit, fee_bps, slippage_bps, no_compound):
     bt.print_report(sym, cfg.interval, result, len(candles))
 
 
-def _load_candles(cfg, days, limit):
+def _load_candles(cfg, days, limit, args=None):
+    """Candles from a local CSV, a Kaggle dataset, or Binance."""
     sym = cfg.symbols[0]
+    src = getattr(args, "source", "binance") if args else "binance"
+    if src in ("csv", "kaggle"):
+        path = getattr(args, "file", None)
+        if src == "kaggle":
+            path = csvdata.download_kaggle(getattr(args, "dataset", None) or path)
+        if not path:
+            print("--source csv needs --file <path to csv or folder>", file=sys.stderr)
+            sys.exit(1)
+        candles, info = csvdata.load(path, args.symbols)
+        _load_candles.last_info = info
+        return candles
     if days:
         end = date.today() - timedelta(days=1)
         start = end - timedelta(days=days - 1)
         print(f"Loading {sym} {cfg.interval} {start}..{end} (data.binance.vision)")
         return datamod.download_klines_range(sym, cfg.interval, start, end)
     return BinanceClient(cfg).klines(sym, cfg.interval, min(limit, 1000))
+
+
+_load_candles.last_info = None
 
 
 def cmd_compare(cfg, days, limit, leverage, fee_bps, slippage_bps, no_compound):
@@ -194,17 +212,36 @@ def cmd_compare(cfg, days, limit, leverage, fee_bps, slippage_bps, no_compound):
 def _analyze_edge(cfg, days, limit, args):
     """Shared by `heatmap` and `ninja`: load candles, run every map."""
     sym = cfg.symbols[0]
-    candles = _load_candles(cfg, days, limit)
+    candles = _load_candles(cfg, days, limit, args)
+    info = _load_candles.last_info
     if len(candles) < 300:
         print("need at least ~300 candles for the maps (try --days 21).",
               file=sys.stderr)
         sys.exit(1)
+
+    # Equity daily bars need equity rules: crypto minute strategies do not
+    # transfer (no shorting, 200-day regime, RSI(2) not RSI(14), calendar effects).
+    if args.strats == "equity":
+        extras = (info or {}).get("extras")
+        cache = eqlib.precompute(candles, extras)
+        registry = eqlib.registry(cache)
+        warmup = 300               # 200-day SMA + 52-week lookbacks must be warm
+        allow_short = False        # every equity rule here is long/flat by design
+        if "vix" not in (extras[0] if extras else {}):
+            print("  note: no VIX column found — the two VIX rules are skipped.")
+    else:
+        cache, registry, warmup, allow_short = None, None, 60, not args.long_only
+    interval = (info or {}).get("interval") or cfg.interval
+    sym = args.symbols or (info and os.path.basename(info["path"])) or sym
+
+    n_strats = len(registry) if registry else len(stratlib.REGISTRY)
     print(f"Analyzing {len(candles)} candles across {args.windows} windows "
-          f"x {len(stratlib.REGISTRY)} strategies ...")
-    a = ana.Analysis(sym, cfg.interval, candles, windows=args.windows,
+          f"x {n_strats} strategies ({args.strats} library) ...")
+    a = ana.Analysis(sym, interval, candles, registry, windows=args.windows,
                      fee_bps=args.fee_bps, slippage_bps=args.slippage_bps,
-                     allow_short=not args.long_only, leverage=args.leverage,
-                     oos_frac=args.oos_frac)
+                     allow_short=allow_short, leverage=args.leverage,
+                     oos_frac=args.oos_frac, cache=cache, extras=(info or {}).get("extras"),
+                     warmup=warmup)
     return a.run_all()
 
 
@@ -301,6 +338,12 @@ def main(argv=None):
                    help="how many ranked strategies to export to NinjaScript")
     p.add_argument("--quantity", type=int, default=1,
                    help="default order quantity in generated NinjaScript")
+    p.add_argument("--source", choices=["binance", "csv", "kaggle"],
+                   default="binance", help="where candles come from")
+    p.add_argument("--file", help="CSV file or folder (--source csv)")
+    p.add_argument("--dataset", help="Kaggle dataset handle (--source kaggle)")
+    p.add_argument("--strats", choices=["crypto", "equity"], default="crypto",
+                   help="strategy library: crypto minutes or US equity dailies")
     p.add_argument("--no-analysis", action="store_true",
                    help="emit NinjaScript templates without measuring anything")
     args = p.parse_args(argv)

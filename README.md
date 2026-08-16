@@ -156,6 +156,65 @@ nine regimes and dozens of parameter cells is hundreds of comparisons — some c
 are blue by luck. The out-of-sample column and the plateau test fight that; they
 don't win it. Re-run on another date range and another symbol before believing a row.
 
+## Other markets: CSV / Kaggle data and the equity strategy library
+
+The crypto rules do not transfer to daily equities, so there is a second library
+(`krypt/strats_equity.py`) written for them, and a loader that eats arbitrary
+OHLCV CSVs (Kaggle dumps, broker exports, TradingView):
+
+```bash
+python3 -m krypt.app heatmap --source csv --file nasdq.csv --symbols NDAQ \
+        --strats equity --fee-bps 1 --slippage-bps 2 --out krypt_nasdaq.html
+
+python3 -m krypt.app heatmap --source kaggle --dataset sai14karthik/nasdq-dataset \
+        --strats equity          # needs `pip install kagglehub` + Kaggle creds
+```
+
+The loader sniffs delimiters, column aliases and date formats (including telling
+`DD/MM` from `MM/DD` by testing the whole column, not the first row), filters
+multi-symbol files, and hands extra columns (VIX, rates, gold, oil) to the
+strategies that can use them.
+
+**The equity library** — `sma200_trend`, `golden_cross`, `connors_rsi2`,
+`ibs_reversion`, `gap_fade`, `turn_of_month`, `momentum_12_1`, `high52_breakout`,
+`vix_calm`, `vix_spike_reversal` — is long/flat by design (no shorting single
+names), gates most rules on the 200-day line, uses RSI(2) rather than RSI(14) for
+reversion, and reads VIX directly when the dataset carries it.
+
+Three things change automatically when the bars are not crypto minutes:
+
+- **Annualization is measured from the timestamps**, not assumed. A 24/7 constant
+  counts 365 bars a year on daily equities instead of ~252 and inflates every
+  Sharpe by ~20%; on intraday equity bars the error is nearly 2x.
+- **Buy & hold is added as a benchmark row** on the same bars and the same costs.
+  A rule that does not beat it risk-adjusted is labelled **BETA ONLY** — it is the
+  market with extra commissions. This matters more than any other column: most
+  long-biased "edges" in a rising market are beta.
+- **The regime axis switches** from ADX buckets to the 200-day line (below /
+  above-flat / above-rising), and an **overnight-vs-intraday decomposition** is
+  added — equities pay unevenly across the session, crypto has no session.
+
+### A worked example, including the answer being "no"
+
+Run on NDAQ daily bars (2010-2024, 3,914 candles, 1 bps fee + 2 bps slippage):
+
+| | return | Sharpe | max DD | exposure |
+|---|---|---|---|---|
+| **buy & hold** | **+700%** | **0.73** | 38.6% | 100% |
+| momentum_12_1 | +367% | 0.61 | 46.5% | 82% |
+| golden_cross | +349% | 0.63 | 38.6% | 77% |
+| sma200_trend | +238% | 0.56 | 48.1% | 77% |
+| connors_rsi2 | +45% | 0.37 | 19.2% | 11% |
+
+Not one rule beat buy & hold on return *or* Sharpe. The cost map explains half of
+it — every reversion rule dies between 5 and 20 bps per side, while the slow trend
+rules are cost-insensitive but simply lag the index. That is a real result, and
+the report says it in the headline rather than crowning the least-bad row.
+
+Read it with the sample in mind: one stock, in a 15-year uptrend, with no 2008 in
+the window — precisely the conditions where a 200-day filter cannot win. The same
+maps on a bear-inclusive range are the interesting follow-up.
+
 ## Exporting to NinjaTrader (NinjaScript)
 
 The strategies that survive the maps can be emitted as NinjaTrader 8 C# strategies:
