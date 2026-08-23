@@ -150,3 +150,23 @@ Prove everything on testnet/paper before risking a cent.
 > Built in a sandbox whose network blocks Binance, so the trading paths were
 > validated by an offline smoke test (`krypt._smoke`) + code review. Run it where
 > Binance is reachable for live data.
+
+---
+
+## Also in this repo: SOLAI (Solana AI signal trader)
+
+KRYPT trades CEX pairs on technical analysis. **SOLAI** (`solai/`) is a
+separate, Solana-native scanner built around a different premise: on Solana
+small caps the edge is not in the chart, it is in the on-chain facts and the
+real cost of getting out.
+
+```bash
+python3 -m solai._smoke      # offline self-test, no network, no API key
+python3 -m solai.app doctor  # config + endpoint reachability
+python3 -m solai.app scan --no-analyst
+```
+
+Four signal families (DEX microstructure, on-chain safety, Jupiter round-trip
+execution cost, smart-money flow) feed a deterministic hurdle-adjusted scorer;
+the shortlist then gets a veto-biased Claude analyst pass. Paper-only — the
+live venue is an intentional stub. See **[SOLAI.md](SOLAI.md)**.
