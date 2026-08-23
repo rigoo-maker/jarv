@@ -12,3 +12,6 @@ krypt_audit.jsonl
 # Python
 __pycache__/
 *.pyc
+
+# SOLAI runtime state (price history, portfolio, trade log)
+.solai/

@@ -4,3 +4,6 @@
 # Required ONLY for live trading on Coinbase Advanced Trade (JWT/ES256 auth):
 PyJWT>=2.8.0
 cryptography>=42.0.0
+
+# SOLAI analyst layer (core is stdlib; this is optional)
+anthropic>=0.40.0
