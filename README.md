@@ -170,3 +170,17 @@ Four signal families (DEX microstructure, on-chain safety, Jupiter round-trip
 execution cost, smart-money flow) feed a deterministic hurdle-adjusted scorer;
 the shortlist then gets a veto-biased Claude analyst pass. Paper-only — the
 live venue is an intentional stub. See **[SOLAI.md](SOLAI.md)**.
+## Also in this repo: TopStep futures toolkit
+
+`topstep/` — strategies and a **risk governor** for TopStep's Trading Combine
+via the TopstepX (ProjectX) API. Built on the premise that on a funded-account
+evaluation the trailing drawdown, not the entry signal, decides whether you
+pass.
+
+```bash
+python3 -m topstep._smoke                        # 38 checks, offline
+python3 -m topstep.app rules --tier 50K
+python3 -m topstep.app sweep --win 0.55 --rr 2   # find the viable risk band
+```
+
+See **[TOPSTEP.md](TOPSTEP.md)**.
