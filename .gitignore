@@ -15,3 +15,5 @@ __pycache__/
 
 # SOLAI runtime state (price history, portfolio, trade log)
 .solai/
+
+# edgelab: market data pulled from the broker connector (regenerate, do not commit large dumps)

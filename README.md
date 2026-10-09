@@ -184,3 +184,19 @@ python3 -m topstep.app sweep --win 0.55 --rr 2   # find the viable risk band
 ```
 
 See **[TOPSTEP.md](TOPSTEP.md)**.
+
+---
+
+## Also in this repo: edgelab
+
+`edgelab/` — a harness that asks whether an apparent edge is real, run on
+**32,110 real daily bars** (10 US ETFs, 2014–2026). It corrects for the size of
+the search, tests a signal's *increment* over simply being invested, and
+charges financing on the leverage a low-vol strategy needs to compete.
+
+```bash
+python3 -m edgelab.report data/etf_daily.csv
+```
+
+Result: of 70 tests, nothing survived correction. The only effects that held
+were the equity risk premium and diversification. See **[EDGELAB.md](EDGELAB.md)**.
