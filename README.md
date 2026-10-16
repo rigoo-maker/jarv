@@ -150,3 +150,53 @@ Prove everything on testnet/paper before risking a cent.
 > Built in a sandbox whose network blocks Binance, so the trading paths were
 > validated by an offline smoke test (`krypt._smoke`) + code review. Run it where
 > Binance is reachable for live data.
+
+---
+
+## Also in this repo: SOLAI (Solana AI signal trader)
+
+KRYPT trades CEX pairs on technical analysis. **SOLAI** (`solai/`) is a
+separate, Solana-native scanner built around a different premise: on Solana
+small caps the edge is not in the chart, it is in the on-chain facts and the
+real cost of getting out.
+
+```bash
+python3 -m solai._smoke      # offline self-test, no network, no API key
+python3 -m solai.app doctor  # config + endpoint reachability
+python3 -m solai.app scan --no-analyst
+```
+
+Four signal families (DEX microstructure, on-chain safety, Jupiter round-trip
+execution cost, smart-money flow) feed a deterministic hurdle-adjusted scorer;
+the shortlist then gets a veto-biased Claude analyst pass. Paper-only — the
+live venue is an intentional stub. See **[SOLAI.md](SOLAI.md)**.
+## Also in this repo: TopStep futures toolkit
+
+`topstep/` — strategies and a **risk governor** for TopStep's Trading Combine
+via the TopstepX (ProjectX) API. Built on the premise that on a funded-account
+evaluation the trailing drawdown, not the entry signal, decides whether you
+pass.
+
+```bash
+python3 -m topstep._smoke                        # 38 checks, offline
+python3 -m topstep.app rules --tier 50K
+python3 -m topstep.app sweep --win 0.55 --rr 2   # find the viable risk band
+```
+
+See **[TOPSTEP.md](TOPSTEP.md)**.
+
+---
+
+## Also in this repo: edgelab
+
+`edgelab/` — a harness that asks whether an apparent edge is real, run on
+**32,110 real daily bars** (10 US ETFs, 2014–2026). It corrects for the size of
+the search, tests a signal's *increment* over simply being invested, and
+charges financing on the leverage a low-vol strategy needs to compete.
+
+```bash
+python3 -m edgelab.report data/etf_daily.csv
+```
+
+Result: of 70 tests, nothing survived correction. The only effects that held
+were the equity risk premium and diversification. See **[EDGELAB.md](EDGELAB.md)**.
